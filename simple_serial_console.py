@@ -39,18 +39,22 @@ class KeyboardThreadChar(threading.Thread):
         self.silent_val = ""
         self.echo_state = True
         self.prompting = True
+        self.exc_info = None  # Pass keyboard interrupt to be re-raised
         click.echo("> ", nl=False)
 
     def run(self):
-        while True:
-            # self.input_cbk(self, readchar.readchar())  # waits to get single character
-            c = click.getchar()
-            self.val += c
-            if self.echo_state:
-                click.echo(c, nl=False)
-            else:
-                self.silent_val += c
-            self.update_inp()  # gets a character and delivers it to input callback
+        try:
+            while True:
+                # self.input_cbk(self, readchar.readchar())  # waits to get single character
+                c = click.getchar()
+                self.val += c
+                if self.echo_state:
+                    click.echo(c, nl=False)
+                else:
+                    self.silent_val += c
+                self.update_inp()  # gets a character and delivers it to input callback
+        except (Exception, KeyboardInterrupt):
+            self.exc_info = sys.exc_info()
 
     def update_inp(self):
         if "\r" in self.val or "\n" in self.val:
@@ -73,17 +77,24 @@ class KeyboardThreadChar(threading.Thread):
         click.echo("> ", nl=False)
         self.val = ""
 
+    def join(self):
+        threading.Thread.join(self)
+        if self.exc_info:
+            msg = "Thread '%s' threw an exception: %s" % (self.getName(), self.exc[1])
+            click.echo(msg)
+            new_exc = Exception(msg)
+            raise new_exc.with_traceback(self.exc[2])
 
-def string_to_packet(packer:msgpack.Packer, text: str, base_packet: ControlPacket = None):
+
+def string_to_packet(packer: msgpack.Packer, text: str, base_packet: ControlPacket = None):
     click.echo(f"Writing {text} into control packet")
     msg = ControlPacket() if base_packet is None else base_packet
     msg.s = text
     bytemsg = MsgPacketize(packer, msg.to_iter())
-    click.echo(''.join(oct(byte)[1:] for byte in bytemsg))
+    click.echo("".join(hex(byte)[1:] for byte in bytemsg))
     # txQueue.put(MsgPacketize(packer, msg.to_iter()))
     # txQueue.put(msgpack.packb(MPZPacket(PICO_RX_INDEX, base_packet)))
     # return base_packet
-
 
 
 def serial_test_msgpack():
@@ -91,7 +102,7 @@ def serial_test_msgpack():
     packer = msgpack.Packer()
     # PSer = PicoSerial(logQue)
     # kthread = KeyboardThreadChar(lambda txt: PSer.write(string_to_packet(txt)))  # start keyboard input thread
-    kthread = KeyboardThreadChar(lambda txt: string_to_packet(packer,txt))
+    kthread = KeyboardThreadChar(lambda txt: string_to_packet(packer, txt))
     PSer = None
     while True:
         for o in unpacker:
@@ -124,6 +135,11 @@ def serial_test_msgpack():
             click.echo(obj)
         if print_console:
             click.echo("> ", nl=False)
+        if kthread.exc_info:
+            if isinstance(kthread.exc_info[1], KeyboardInterrupt):
+                print("Exiting Console.")
+                break
+            raise kthread.exc_info[1].with_traceback(kthread.exc_info[2])
 
 
 def console_test():
