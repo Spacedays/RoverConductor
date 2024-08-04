@@ -1,0 +1,5 @@
+evdev~=1.7.1
+pyserial
+click
+msgpack
+crc8
