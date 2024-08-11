@@ -16,12 +16,19 @@ import click
 import msgpack
 from msgpack import Packer, Unpacker
 
-from pico_interface import TERMSEQ, LEN_SEP, ControlPacket, PacketMsg, PicoSerial
+from pico_interface import (
+    TERMSEQ,
+    LEN_SEP,
+    STR_DELIM,
+    # BYTES_DELIM,
+    # BYTES_TERM,
+    ControlPacket,
+    PacketMsg,
+    PicoSerial,
+)
 
 logQue = queue.Queue(-1)  # no max size; if max size, prep for queue full exception
-log_queue_handler = QueueHandler(
-    logQue
-)  # accepts logging messages to allow seperate threads
+log_queue_handler = QueueHandler(logQue)  # accepts logging messages to allow seperate threads
 handler = logging.StreamHandler()  # TODO - wat dis?
 listener = QueueListener(logQue, handler)
 
@@ -29,6 +36,15 @@ root = logging.getLogger()
 root.addHandler(log_queue_handler)
 formatter = logging.Formatter("%(threadName)s: %(message)s")  # LATER
 handler.setFormatter(formatter)
+
+# def logexception(self, msg, /, *args, **kwargs):
+#     """
+#     Delegate an exception call to the underlying logger, after adding
+#     contextual information from this adapter instance.
+#     """
+#     msg, kwargs = self.process(msg, kwargs)
+#     self.logger.debug(msg, *args, **kwargs)
+
 listener.start()  # starts background logger thread   #TESTME   #TODO: use logQue somewhere
 
 txQueue = queue.Queue(-1)
@@ -98,7 +114,7 @@ class KeyboardThreadChar(threading.Thread):
 
 
 def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
-    click.echo(f"Writing {text} into control packet\r", nl=False)
+    click.echo(f"Writing {text} into control packet\r")
     msg = ControlPacket() if base_packet is None else base_packet
     msg.s = bytes(text, "utf-8")
     # bytemsg = MsgPacketize(packer, msg.to_iter())
@@ -133,12 +149,18 @@ def serial_test_msgpack():
             parse_messages(unpacker, PSer.port.read(PSer.port.in_waiting))
         except Exception as e:
             kthread.pause = True
-            click.echo(traceback.format_exc())
+            print("-" * 78)
+            click.echo(bytes(traceback.format_exc(), "utf-8"), err=True)
+            # print(traceback.format_exc())
             click.echo(
                 interactive_parse(
                     e.__cause__.args[0] if e and e.__cause__ and e.__cause__.args else e
-                )
+                ),
+                err=True,
             )
+            # click.echo(click.wrap_text(e,initial_indent="",subsequent_indent="  ",preserve_paragraphs=True))
+            # click.echo(mbytes, err=True)
+            # click.echo("-"*78, err=True)
         # show console indicator if it was replaced with message contents
         print_console = False
         obj = None
@@ -151,10 +173,15 @@ def serial_test_msgpack():
                     continue
                 if first_print:
                     kthread.toggle_silence()
-                    sys.stdout.write("\033[2K\033[1G")
+                    # sys.stdout.write("\033[2K\033[1G") #1G -> move cursor to column n (1)
+                    # Clear current line w/ ANSI escape CSI/Control Sequence Introducer (starts w/ "\e["):
+                    print("\e[2K", end="\r")    # 2K  K=erase in line, 0 or none=cursor->end, 1=start->cursor, 2=whole line. 
+                    # print("\e[1A", end="\r")    # 1A  A=Cursor up, 1=1 line 
                     first_print = False
 
-                click.echo(f"\r~RX:{obj}\r")  # DEBUG
+                click.echo(
+                    f"\r~RX:{obj}\r"
+                )  # DEBUG # TODO: remove leading \r and uncomment above \r
                 print_console = True
         except queue.Empty:
             pass
@@ -188,19 +215,20 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
             # No separator -> string data
             if idx < 0:
                 # click.echo(f"Str:{mbytes.decode(encoding='utf-8')}\n")    #DEBUG
-                rxQueue.put(f"Str:{mbytes.decode(encoding='utf-8')}")
+                rxQueue.put(mbytes.decode("utf-8", "backslashreplace"))
             # Separator -> truncate message and process it later as a string
             elif idx > 0:
                 # get first digit and use it as the message length
                 m = re.search(b"([0-9]+)", mbytes)
                 mlen = int(mbytes[: m.span()[1]])  # //2  #TODO: why /2? /x delimeter?
                 mstart = m.span()[1] + len(b"~")
-                strmsg = mbytes[mstart + mlen :]
                 mbytes = mbytes[mstart : mstart + mlen]
+                strmsg = mbytes[mstart + mlen :]
         except Exception as e:
-            click.echo(f"Exception raised while parsing string!\r\t{e}\r")
-            click.echo(mbytes)
+            # click.echo("\r\nException raised while parsing string!",err=True)#\r\n\t{e}", err=True)
+            print("\r\nException raised while parsing string!", end="\r\n")
             e.__cause__ = BaseException(mbytes)
+            # root.exception("Logging - Failed reading string", e)  #TODO
             raise e
 
         if idx < 0:
@@ -209,27 +237,23 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
         unpacker.feed(mbytes)
         rxQueue.put(unpacker.unpack())
         if strmsg:
-            startidx = strmsg.find(b"-\n")
+            startidx = strmsg.find(STR_DELIM)
             if startidx < 0:
                 continue
-            strmsg = strmsg[strmsg.find(b"-\n") + 2 :]
+            strmsg = strmsg[strmsg.find(STR_DELIM) + 2 :]
             # click.echo(f"Str:{strmsg.decode(encoding='utf-8')}\n")
-            rxQueue.put(strmsg.decode(encoding="utf-8"))
+            rxQueue.put(strmsg.decode("utf-8", "backslashreplace"))
 
 
 def interactive_parse(packedmsg: bytearray):
     click.echo(f"Parsing: {packedmsg}")
-    if not click.confirm(
-        f"Unpacking failed. Try again manually?\r{packedmsg}", default=True
-    ):
+    if not click.confirm(f"Unpacking failed. Try again manually?\r{packedmsg}", default=False):
         return
     while True:
         try:
             ans = click.prompt(
                 "What would you like to parse?",
-                type=click.Choice(
-                    ("int", "str", "strsearch", "bytestrsearch", "unpack", "quit")
-                ),
+                type=click.Choice(("int", "str", "strsearch", "bytestrsearch", "unpack", "quit")),
             )
             if ans == "strsearch":
                 s: str = click.prompt("Enter the string to search for")
@@ -243,7 +267,7 @@ def interactive_parse(packedmsg: bytearray):
             elif ans == "str":
                 i = int(click.prompt("Enter the starting index of the string"))
                 j = int(click.prompt("Enter the length of the string"))
-                click.echo(f"\t{packedmsg[i:i+j].decode()}")
+                click.echo(f"\t{packedmsg[i:i+j].decode("utf-8","backslashreplace")}")
 
             elif ans == "bytestrsearch":
                 s = click.prompt("Enter the bytestring to eval & search: ")
@@ -252,14 +276,8 @@ def interactive_parse(packedmsg: bytearray):
 
             elif ans == "unpack":
                 click.echo()
-                i = int(
-                    click.prompt(
-                        "Enter the starting index of the packed message", type=int
-                    )
-                )
-                j = int(
-                    click.prompt("Enter the length of the packed message", type=int)
-                )
+                i = int(click.prompt("Enter the starting index of the packed message", type=int))
+                j = int(click.prompt("Enter the length of the packed message", type=int))
                 obj = msgpack.unpackb(packedmsg[i : i + j])
                 click.echo(f"\t{obj}")
 
