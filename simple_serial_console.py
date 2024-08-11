@@ -56,8 +56,6 @@ class KeyboardThreadChar(threading.Thread):
                     self.val += c
                     if self.echo_state:
                         click.echo(c, nl=False)
-                    else:
-                        self.silent_val += c
                     self.update_inp()  # Detects newlines (complete commands) and prints them
         except (Exception, KeyboardInterrupt):
             self.exc_info = sys.exc_info()
@@ -73,8 +71,7 @@ class KeyboardThreadChar(threading.Thread):
     def toggle_silence(self):
         # Print silenced text
         if not self.echo_state:
-            click.echo(self.silent_val, nl=False)
-            self.silent_val = ""
+            click.echo(self.val, nl=False)
         self.echo_state = not self.echo_state
 
     def parse_lines(self):
@@ -101,9 +98,9 @@ class KeyboardThreadChar(threading.Thread):
 
 
 def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
-    click.echo(f"Writing {text} into control packet")
+    click.echo(f"Writing {text} into control packet\r", nl=False)
     msg = ControlPacket() if base_packet is None else base_packet
-    msg.s = bytes(text, 'utf-8')
+    msg.s = bytes(text, "utf-8")
     # bytemsg = MsgPacketize(packer, msg.to_iter())
     # click.echo("".join(hex(byte)[1:] for byte in bytemsg))  # DEBUG
     bytemsg = PacketMsg(packer, msg.to_iter())
@@ -157,7 +154,7 @@ def serial_test_msgpack():
                     sys.stdout.write("\033[2K\033[1G")
                     first_print = False
 
-                click.echo(f"\r~RX:{obj}")  # DEBUG
+                click.echo(f"\r~RX:{obj}\r")  # DEBUG
                 print_console = True
         except queue.Empty:
             pass
