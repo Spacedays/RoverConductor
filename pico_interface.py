@@ -7,25 +7,35 @@ import msgpack
 import struct
 import crc8
 
-serlog = logging.getLogger("pico_serial")  # TESTME - does this log from another thread once setup?
+serlog = logging.getLogger(
+    "pico_serial"
+)  # TESTME - does this log from another thread once setup?
 
+TERMSEQ = b"\n~"
+LEN_SEP = b"~"
 PICO_RX_INDEX = 0x21
 hash = crc8.crc8()
 
+# FIXME - replace
+# def UnPacketize(code, data):
+#     if code == PICO_RX_INDEX:
+#         obj = struct.unpack(data)
+#         return obj
+#     return msgpack.ExtType(code, data)
 
-def UnPacketize(code, data):
-    if code == PICO_RX_INDEX:
-        obj = struct.unpack(data)
-        return obj
-    return msgpack.ExtType(code, data)
+
+# def MsgPacketize(packer: msgpack.Packer, data):
+#     """Wrap the bytes with an index and crc"""
+#     bytedata = packer.pack(data)
+#     hash.update(bytedata)
+#     hash.reset()
+#     return b"".join([PICO_RX_INDEX.to_bytes(), bytedata, hash.digest()])
 
 
-def MsgPacketize(packer: msgpack.Packer, data):
-    """Wrap the bytes with an index and crc"""
+def PacketMsg(packer: msgpack.Packer, data):
+    """Wrap the bytes with a start character and length"""
     bytedata = packer.pack(data)
-    hash.update(bytedata)
-    hash.reset()
-    return b"".join([PICO_RX_INDEX.to_bytes(), bytedata, hash.digest()])
+    return b"".join((TERMSEQ, bytes(str(len(bytedata)), "utf-8"), LEN_SEP, bytedata))
 
 
 # @dataclass
@@ -58,7 +68,9 @@ class ControlPacket:
 
 
 class PicoSerial:
-    def __init__(self, queue: Queue, portname: str = None, baudrate: int = 115200) -> None:
+    def __init__(
+        self, queue: Queue, portname: str = None, baudrate: int = 115200
+    ) -> None:
         self.q = queue  # TODO read q
         self.port = None
         # self.baudrate = baudrate
@@ -77,12 +89,15 @@ class PicoSerial:
                 pico_ports.append(portname)
                 pico_desc.append(desc + f" ; {hwid}")
 
-        if len(pico_ports) > 1:
+        if len(pico_ports) == 0:
+            raise FileNotFoundError("No pico serial ports found!")
+        elif len(pico_ports) > 1:
             serlog.warn(
                 f"Other picos found! Returning first device {pico_ports[0]} ; {pico_desc[0]}"
             )
         return pico_ports[0]
 
+    # TODO: disambiguate
     def write(self, data):
         print("Writing ", data)
         self.port.write(data)
