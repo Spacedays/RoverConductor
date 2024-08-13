@@ -4,15 +4,14 @@ import serial.tools.list_ports
 import logging
 from dataclasses import dataclass
 import msgpack
-import struct
-import crc8
+# import crc8
 
 serlog = logging.getLogger("pico_serial")  # TESTME - does this log from another thread once setup?
 
 PACKETDELIM = b"\n~"
 LEN_SEP = b"~"
 PICO_RX_INDEX = 0x21
-hash = crc8.crc8()
+# hash = crc8.crc8()
 
 # FIXME - replace; encloses msgpack inbetween index & CRC
 # def UnPacketize(code, data):
@@ -83,9 +82,9 @@ class PicoSerial:
         for portname, desc, hwid in serial.tools.list_ports.comports():
             if searchstr in (desc.lower() + hwid):
                 pico_ports.append(portname)
-                pico_desc.append(desc + f" ; {hwid}")
+                pico_desc.append(f"{desc} ; {hwid}")
 
-        if len(pico_ports) == 0:
+        if not pico_ports:
             raise FileNotFoundError("No pico serial ports found!")
         elif len(pico_ports) > 1:
             serlog.warn(

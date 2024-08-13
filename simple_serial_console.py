@@ -3,6 +3,7 @@
 
 
 import ast
+import contextlib
 import logging
 import queue
 import sys
@@ -48,10 +49,10 @@ txQueue = queue.Queue(-1)
 rxQueue = queue.Queue(-1)
 
 
-class KeyboardThreadChar(threading.Thread):
+class ThreadedKeyboardInput(threading.Thread):
     def __init__(self, newline_cbk=None, name="keyboard-input-thread"):
         self.newline_cbk = newline_cbk
-        super(KeyboardThreadChar, self).__init__(name=name, daemon=True)
+        super(ThreadedKeyboardInput, self).__init__(name=name, daemon=True)
         self.val = ""
         self.silent_val = ""  # characters typed while echo_state is false
         self.echo_state = True
@@ -88,7 +89,7 @@ class KeyboardThreadChar(threading.Thread):
         self.echo_state = not self.echo_state
 
     def parse_lines(self):
-        if not ("\r" in self.val or "\n" in self.val):
+        if "\r" not in self.val and "\n" not in self.val:
             return
 
         lines = self.val.splitlines()  # strip terminating characters
@@ -103,7 +104,7 @@ class KeyboardThreadChar(threading.Thread):
     def join(self):
         threading.Thread.join(self)
         if self.exc_info:
-            msg = "Thread '%s' threw an exception: %s" % (self.getName(), self.exc[1])
+            msg = f"Thread '{self.getName()}' threw an exception: {self.exc[1]}"
             click.echo(f"exception: \r{msg}")  # (msg)
             new_exc = Exception(msg)
             raise new_exc.with_traceback(self.exc[2])
@@ -123,7 +124,7 @@ def msgpack_console():
     unpacker = Unpacker()
     packer = Packer()
     PSer = PicoSerial(logQue)
-    kthread = KeyboardThreadChar(lambda txt: string_to_packet(packer, txt))
+    kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt))
     while True:
         obj = 0
         while not txQueue.empty() and obj is not None:  # and PSer is not None:
@@ -157,7 +158,7 @@ def msgpack_console():
         print_console = False
         obj = None
         first_print = True
-        try:
+        with contextlib.suppress(queue.Empty):
             for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
                 if obj is None:
                     continue
@@ -171,8 +172,6 @@ def msgpack_console():
 
                 click.echo(f"~RX:{obj}\r")
                 print_console = True
-        except queue.Empty:
-            pass
         if print_console:
             click.echo("> ", nl=False)
             kthread.toggle_silence()
@@ -291,7 +290,7 @@ def console_test():
 
 def advanced_console_test():
     packer = Packer()
-    kthread = KeyboardThreadChar(lambda txt: string_to_packet(packer, txt))
+    kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt))
     while True:
         obj = None
         while not txQueue.empty() and obj is not None:  # and PSer is not None:
@@ -301,14 +300,12 @@ def advanced_console_test():
         # show console indicator if it was replaced with message contents
         print_console = obj is not None
         obj = None
-        try:
+        with contextlib.suppress(queue.Empty):
             for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
                 if obj is None:
                     break
                 click.echo(f"~RX:{obj}")  # DEBUG
                 print_console = True
-        except queue.Empty:
-            pass
         if print_console:
             click.echo("> ", nl=False)
             print_console = False
@@ -325,7 +322,7 @@ def escchar_test():
         c = click.getchar()
         if c == "~":
             c = " "
-            while c[-1] != "\n" and c[-1] != "\r":
+            while c[-1] not in ["\n", "\r"]:
                 c += click.getchar(echo=True)
             click.echo()
         click.echo(str(bytes(c, "utf-8")))
