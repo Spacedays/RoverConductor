@@ -7,17 +7,14 @@ import msgpack
 import struct
 import crc8
 
-serlog = logging.getLogger(
-    "pico_serial"
-)  # TESTME - does this log from another thread once setup?
+serlog = logging.getLogger("pico_serial")  # TESTME - does this log from another thread once setup?
 
-TERMSEQ = b"\n~"
+PACKETDELIM = b"\n~"
 LEN_SEP = b"~"
-STR_DELIM = b"-\n-"  # Located @ end of packed messages if there is text following them
 PICO_RX_INDEX = 0x21
 hash = crc8.crc8()
 
-# FIXME - replace
+# FIXME - replace; encloses msgpack inbetween index & CRC
 # def UnPacketize(code, data):
 #     if code == PICO_RX_INDEX:
 #         obj = struct.unpack(data)
@@ -36,7 +33,7 @@ hash = crc8.crc8()
 def PacketMsg(packer: msgpack.Packer, data):
     """Wrap the bytes with a start character and length"""
     bytedata = packer.pack(data)
-    return b"".join((TERMSEQ, bytes(str(len(bytedata)), "utf-8"), LEN_SEP, bytedata))
+    return b"".join((PACKETDELIM, bytes(str(len(bytedata)), "utf-8"), LEN_SEP, bytedata))
 
 
 # @dataclass
@@ -69,9 +66,7 @@ class ControlPacket:
 
 
 class PicoSerial:
-    def __init__(
-        self, queue: Queue, portname: str = None, baudrate: int = 115200
-    ) -> None:
+    def __init__(self, queue: Queue, portname: str = None, baudrate: int = 115200) -> None:
         self.q = queue  # TODO read q
         self.port = None
         # self.baudrate = baudrate

@@ -17,11 +17,8 @@ import msgpack
 from msgpack import Packer, Unpacker
 
 from pico_interface import (
-    TERMSEQ,
+    PACKETDELIM,
     LEN_SEP,
-    STR_DELIM,
-    # BYTES_DELIM,
-    # BYTES_TERM,
     ControlPacket,
     PacketMsg,
     PicoSerial,
@@ -189,7 +186,7 @@ def msgpack_console():
 
 # HACK - extra characters at the end??
 def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
-    messages = re.split(TERMSEQ, rx_bytes)  # does not include termseq separator in list
+    messages = re.split(PACKETDELIM, rx_bytes)  # does not include termseq separator in list
     if len(messages) == 0:
         return
 
@@ -205,7 +202,9 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
             idx = mbytes.find(LEN_SEP)
             # No separator -> string data
             if idx < 0:
-                rxQueue.put(mbytes.decode("utf-8", "backslashreplace")) # escapes control chars with backslash
+                rxQueue.put(
+                    mbytes.decode("utf-8", "backslashreplace")
+                )  # escapes control chars with backslash
             # Separator -> truncate message and process it later as a string
             elif idx > 0:
                 # get first digit and use it as the message length
