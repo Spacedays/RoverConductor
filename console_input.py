@@ -100,7 +100,7 @@ def threaded_console_example():
                     kthread.toggle_silence()
                     first_print = False
                 rxQueue.put(obj)
-                click.echo(f">TX: {obj}")
+                click.echo(f">TX: {obj}\r")
 
         # reset console input
         if not first_print:

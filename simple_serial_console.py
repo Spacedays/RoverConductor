@@ -50,7 +50,7 @@ rxQueue = queue.Queue(-1)
 
 
 def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
-    click.echo(f"\tWriting {text} into control packet\r")
+    click.echo(f"  Writing {text} into control packet\r")
     msg = ControlPacket() if base_packet is None else base_packet
     msg.s = text  # bytes(text, "utf-8")
     bytemsg = PacketMsg(packer, msg.to_iter())
@@ -74,7 +74,7 @@ def msgpack_console():
                     kthread.toggle_silence()
                     first_print = False
                 PSer.port.write(obj)
-                click.echo(f">TX: {obj}")
+                click.echo(f">TX: {obj}\r")
         if not first_print:
             kthread.toggle_silence()
 
