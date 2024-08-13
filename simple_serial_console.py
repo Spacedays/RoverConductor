@@ -1,13 +1,12 @@
 #!/usr/bin/env -S /bin/sh -c '"$(dirname "$0")/.venv/bin/python3" "$0" "$@"'
-#### A simple keyboard interface to the rover
+# ^ Run using local .venv
 
+#### A simple keyboard interface to the rover
 
 import ast
 import contextlib
 import logging
 import queue
-import sys
-import threading
 from logging.handlers import QueueHandler  # LATER -- use & test logs
 from logging.handlers import QueueListener
 import traceback
@@ -17,6 +16,7 @@ import click
 import msgpack
 from msgpack import Packer, Unpacker
 
+from console_input import ThreadedKeyboardInput
 from pico_interface import (
     PACKETDELIM,
     LEN_SEP,
@@ -49,69 +49,8 @@ txQueue = queue.Queue(-1)
 rxQueue = queue.Queue(-1)
 
 
-class ThreadedKeyboardInput(threading.Thread):
-    def __init__(self, newline_cbk=None, name="keyboard-input-thread"):
-        self.newline_cbk = newline_cbk
-        super(ThreadedKeyboardInput, self).__init__(name=name, daemon=True)
-        self.val = ""
-        self.silent_val = ""  # characters typed while echo_state is false
-        self.echo_state = True
-        self.exc_info = None  # Pass keyboard interrupt to be re-raised
-        self.running = True
-        self.pause = False
-        click.echo("> ", nl=False)
-        self.start()
-
-    def run(self):
-        try:
-            while self.running:
-                if not self.pause:
-                    c = click.getchar(echo=self.echo_state)  # echo=False)
-                    # terminal control: ANSI escape codes
-                    # destructive bksp \x7F (non-std) and \b (AKA'\x08) seem to behave similarly (no erase, just cursor movement).
-                    #   --> clear line after cursor
-                    if c == "\x7f":
-                        # delete previous char and clear the line after the cursor
-                        self.val = self.val[:-1]
-                        click.echo(
-                            "\033\b\033[K", nl=False
-                        )  # \b: bksp \033[K : backspace & erase chars after cursor
-                        continue
-                    self.val += c
-                    self.parse_lines()  # Detects newlines (complete commands) and prints them
-        except (Exception, KeyboardInterrupt):
-            self.exc_info = sys.exc_info()
-
-    def toggle_silence(self):
-        # If echo was off, print silenced text
-        if not self.echo_state:
-            click.echo(self.val, nl=False)
-        self.echo_state = not self.echo_state
-
-    def parse_lines(self):
-        if "\r" not in self.val and "\n" not in self.val:
-            return
-
-        lines = self.val.splitlines()  # strip terminating characters
-        for line in lines:
-            if self.newline_cbk is not None:
-                self.newline_cbk(line)
-            else:
-                click.echo(f"Entered: {line}")
-        click.echo("> ", nl=False)
-        self.val = ""
-
-    def join(self):
-        threading.Thread.join(self)
-        if self.exc_info:
-            msg = f"Thread '{self.getName()}' threw an exception: {self.exc[1]}"
-            click.echo(f"exception: \r{msg}")  # (msg)
-            new_exc = Exception(msg)
-            raise new_exc.with_traceback(self.exc[2])
-
-
 def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
-    click.echo(f"Writing {text} into control packet\r")
+    click.echo(f"\tWriting {text} into control packet\r")
     msg = ControlPacket() if base_packet is None else base_packet
     msg.s = text  # bytes(text, "utf-8")
     bytemsg = PacketMsg(packer, msg.to_iter())
@@ -126,15 +65,19 @@ def msgpack_console():
     PSer = PicoSerial(logQue)
     kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt))
     while True:
-        obj = 0
-        while not txQueue.empty() and obj is not None:  # and PSer is not None:
-            obj = txQueue.get(block=True, timeout=0.01)
-            if obj is None:
-                continue
-            click.echo(f">TX: {obj}")
-            PSer.port.write(obj)
+        first_print = True
+        with contextlib.suppress(queue.Empty):  # and PSer is not None:
+            for obj in iter(lambda: txQueue.get(block=True, timeout=0.01), None):
+                if obj is None:
+                    continue
+                if first_print:
+                    kthread.toggle_silence()
+                    first_print = False
+                PSer.port.write(obj)
+                click.echo(f">TX: {obj}")
+        if not first_print:
+            kthread.toggle_silence()
 
-        # kthread.toggle_silence()
         for o in unpacker:
             rxQueue.put(o)
 
@@ -154,28 +97,19 @@ def msgpack_console():
             # click.echo(click.wrap_text(e,initial_indent="",subsequent_indent="  ",preserve_paragraphs=True))
             # click.echo(mbytes, err=True)
             # click.echo("-"*78, err=True)
-        # show console indicator if it was replaced with message contents
-        print_console = False
+
         obj = None
-        first_print = True
+        first_print = True  # silence input while printing
         with contextlib.suppress(queue.Empty):
             for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
                 if obj is None:
                     continue
                 if first_print:
                     kthread.toggle_silence()
-                    # Clear current line w/ ANSI escape seq: CSI/Control Sequence Introducer (starts w/ "\e[" or "\033"):
-                    # print("\033[1A", end="\r")    # 1A  A=Cursor up, 1=1 line
-                    # 2K  K=erase in line, 0 or none=cursor->end, 1=start->cursor, 2=whole line.
-                    print("\033[2K", end="\r")
                     first_print = False
-
                 click.echo(f"~RX:{obj}\r")
-                print_console = True
-        if print_console:
-            click.echo("> ", nl=False)
+        if not first_print:
             kthread.toggle_silence()
-            print_console = False
         if kthread.exc_info:
             if isinstance(kthread.exc_info[1], KeyboardInterrupt):
                 print("Exiting Console.")
@@ -183,7 +117,6 @@ def msgpack_console():
             raise kthread.exc_info[1].with_traceback(kthread.exc_info[2])
 
 
-# HACK - extra characters at the end??
 def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
     messages = re.split(PACKETDELIM, rx_bytes)  # does not include termseq separator in list
     if len(messages) == 0:
@@ -201,9 +134,7 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
             idx = mbytes.find(LEN_SEP)
             # No separator -> string data
             if idx < 0:
-                rxQueue.put(
-                    mbytes.decode("utf-8", "backslashreplace")
-                )  # escapes control chars with backslash
+                rxQueue.put(mbytes.decode("utf-8", "backslashreplace"))  # escapes escape chars
             # Separator -> truncate message and process it later as a string
             elif idx > 0:
                 # get first digit and use it as the message length
@@ -229,6 +160,7 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
             rxQueue.put(strmsg.decode("utf-8", "backslashreplace"))
 
 
+#TODO: improve / replace / remove
 def interactive_parse(packedmsg: bytearray):
     click.echo(f"Parsing: {packedmsg}")
     if not click.confirm(f"Unpacking failed. Try again manually?\r{packedmsg}", default=False):
@@ -273,65 +205,5 @@ def interactive_parse(packedmsg: bytearray):
         except Exception as e:
             click.echo(f"Command failed: {e}")
 
-
-def console_test():
-    click.echo("Starting!")
-    msg = ""
-    try:
-        while True:
-            msg += click.getchar()
-            # click.echo(msg)
-            if "\r" in msg:
-                cmd, msg = msg.split("\r")
-                click.echo(f"Entered: {cmd}")
-    finally:
-        print("Done.")
-
-
-def advanced_console_test():
-    packer = Packer()
-    kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt))
-    while True:
-        obj = None
-        while not txQueue.empty() and obj is not None:  # and PSer is not None:
-            obj = txQueue.get(block=True, timeout=0.01)
-            click.echo(f">TX: {obj}")
-
-        # show console indicator if it was replaced with message contents
-        print_console = obj is not None
-        obj = None
-        with contextlib.suppress(queue.Empty):
-            for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
-                if obj is None:
-                    break
-                click.echo(f"~RX:{obj}")  # DEBUG
-                print_console = True
-        if print_console:
-            click.echo("> ", nl=False)
-            print_console = False
-        if kthread.exc_info:
-            if isinstance(kthread.exc_info[1], KeyboardInterrupt):
-                print("Exiting Console.")
-                break
-            raise kthread.exc_info[1].with_traceback(kthread.exc_info[2])
-
-
-def escchar_test():
-    while True:
-        click.echo("\r\n> ", nl=False)
-        c = click.getchar()
-        if c == "~":
-            c = " "
-            while c[-1] not in ["\n", "\r"]:
-                c += click.getchar(echo=True)
-            click.echo()
-        click.echo(str(bytes(c, "utf-8")))
-        click.echo(f"\nchar: {c}\n")
-
-
 if __name__ == "__main__":
-    # serial_test_msgpack_orig()
     msgpack_console()
-    # console_test()
-    # advanced_console_test()
-    # escchar_test()
