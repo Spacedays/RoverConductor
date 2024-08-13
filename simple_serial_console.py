@@ -68,32 +68,31 @@ class KeyboardThreadChar(threading.Thread):
         try:
             while self.running:
                 if not self.pause:
-                    c = click.getchar(echo=False)
+                    c = click.getchar(echo=self.echo_state)  # echo=False)
+                    # terminal control: ANSI escape codes
+                    # destructive bksp \x7F (non-std) and \b (AKA'\x08) seem to behave similarly (no erase, just cursor movement).
+                    #   --> clear line after cursor
+                    if c == "\x7f":
+                        # delete previous char and clear the line after the cursor
+                        self.val = self.val[:-1]
+                        click.echo(
+                            "\033\b\033[K", nl=False
+                        )  # \b: bksp \033[K : backspace & erase chars after cursor
+                        continue
                     self.val += c
-                    if self.echo_state:
-                        click.echo(c, nl=False)
-                    self.update_inp()  # Detects newlines (complete commands) and prints them
+                    self.parse_lines()  # Detects newlines (complete commands) and prints them
         except (Exception, KeyboardInterrupt):
             self.exc_info = sys.exc_info()
 
-    def update_inp(self):
-        if "\r" in self.val or "\n" in self.val:
-            # click.echo('~rn')   #DEBUG
-            # sys.stdout.write(
-            #     "\033[2K\033[1G"
-            # )  # clear line and reset to start #TESTME - how should this behave?
-            self.parse_lines()
-
     def toggle_silence(self):
-        # Print silenced text
+        # If echo was off, print silenced text
         if not self.echo_state:
             click.echo(self.val, nl=False)
         self.echo_state = not self.echo_state
 
     def parse_lines(self):
-        # if not ("\r" in self.val or "\n" in self.val):
-        #     return
-        # sys.stdout.write("\033[2K\033[1G")  # clear line and reset to start #TESTME - how should this behave?
+        if not ("\r" in self.val or "\n" in self.val):
+            return
 
         lines = self.val.splitlines()  # strip terminating characters
         for line in lines:
@@ -116,17 +115,13 @@ class KeyboardThreadChar(threading.Thread):
 def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
     click.echo(f"Writing {text} into control packet\r")
     msg = ControlPacket() if base_packet is None else base_packet
-    msg.s = bytes(text, "utf-8")
-    # bytemsg = MsgPacketize(packer, msg.to_iter())
-    # click.echo("".join(hex(byte)[1:] for byte in bytemsg))  # DEBUG
+    msg.s = text  # bytes(text, "utf-8")
     bytemsg = PacketMsg(packer, msg.to_iter())
+    # click.echo(f'Packed {msg} to\r\n\t{packer.pack(msg.to_iter())} as\r\n\t{bytemsg}')    #DEBUG
     txQueue.put(bytemsg)
-    # txQueue.put(msgpack.packb(MPZPacket(PICO_RX_INDEX, base_packet)))
-    # txQueue.put(packer.pack(msg.to_iter()))
-    # return base_packet
 
 
-def serial_test_msgpack():
+def msgpack_console():
     # rx_bytes = bytearray(128)
     unpacker = Unpacker()
     packer = Packer()
@@ -167,21 +162,17 @@ def serial_test_msgpack():
         first_print = True
         try:
             for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
-                # while not rxQueue.empty():
-                # obj = rxQueue.get_nowait()
                 if obj is None:
                     continue
                 if first_print:
                     kthread.toggle_silence()
-                    # sys.stdout.write("\033[2K\033[1G") #1G -> move cursor to column n (1)
-                    # Clear current line w/ ANSI escape CSI/Control Sequence Introducer (starts w/ "\e["):
-                    print("\e[2K", end="\r")    # 2K  K=erase in line, 0 or none=cursor->end, 1=start->cursor, 2=whole line. 
-                    # print("\e[1A", end="\r")    # 1A  A=Cursor up, 1=1 line 
+                    # Clear current line w/ ANSI escape seq: CSI/Control Sequence Introducer (starts w/ "\e[" or "\033"):
+                    # print("\033[1A", end="\r")    # 1A  A=Cursor up, 1=1 line
+                    # 2K  K=erase in line, 0 or none=cursor->end, 1=start->cursor, 2=whole line.
+                    print("\033[2K", end="\r")
                     first_print = False
 
-                click.echo(
-                    f"\r~RX:{obj}\r"
-                )  # DEBUG # TODO: remove leading \r and uncomment above \r
+                click.echo(f"~RX:{obj}\r")
                 print_console = True
         except queue.Empty:
             pass
@@ -214,13 +205,12 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
             idx = mbytes.find(LEN_SEP)
             # No separator -> string data
             if idx < 0:
-                # click.echo(f"Str:{mbytes.decode(encoding='utf-8')}\n")    #DEBUG
-                rxQueue.put(mbytes.decode("utf-8", "backslashreplace"))
+                rxQueue.put(mbytes.decode("utf-8", "backslashreplace")) # escapes control chars with backslash
             # Separator -> truncate message and process it later as a string
             elif idx > 0:
                 # get first digit and use it as the message length
                 m = re.search(b"([0-9]+)", mbytes)
-                mlen = int(mbytes[: m.span()[1]])  # //2  #TODO: why /2? /x delimeter?
+                mlen = int(mbytes[: m.span()[1]])
                 mstart = m.span()[1] + len(b"~")
                 mbytes = mbytes[mstart : mstart + mlen]
                 strmsg = mbytes[mstart + mlen :]
@@ -235,13 +225,9 @@ def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
             continue
 
         unpacker.feed(mbytes)
+        rxQueue.put(mbytes)
         rxQueue.put(unpacker.unpack())
         if strmsg:
-            startidx = strmsg.find(STR_DELIM)
-            if startidx < 0:
-                continue
-            strmsg = strmsg[strmsg.find(STR_DELIM) + 2 :]
-            # click.echo(f"Str:{strmsg.decode(encoding='utf-8')}\n")
             rxQueue.put(strmsg.decode("utf-8", "backslashreplace"))
 
 
@@ -310,7 +296,7 @@ def advanced_console_test():
     while True:
         obj = None
         while not txQueue.empty() and obj is not None:  # and PSer is not None:
-            obj = txQueue.get_nowait()
+            obj = txQueue.get(block=True, timeout=0.01)
             click.echo(f">TX: {obj}")
 
         # show console indicator if it was replaced with message contents
@@ -334,8 +320,22 @@ def advanced_console_test():
             raise kthread.exc_info[1].with_traceback(kthread.exc_info[2])
 
 
+def escchar_test():
+    while True:
+        click.echo("\r\n> ", nl=False)
+        c = click.getchar()
+        if c == "~":
+            c = " "
+            while c[-1] != "\n" and c[-1] != "\r":
+                c += click.getchar(echo=True)
+            click.echo()
+        click.echo(str(bytes(c, "utf-8")))
+        click.echo(f"\nchar: {c}\n")
+
+
 if __name__ == "__main__":
     # serial_test_msgpack_orig()
-    serial_test_msgpack()
+    msgpack_console()
     # console_test()
     # advanced_console_test()
+    # escchar_test()

@@ -13,7 +13,7 @@ serlog = logging.getLogger(
 
 TERMSEQ = b"\n~"
 LEN_SEP = b"~"
-STR_DELIM = b"-\n"  # Located @ end of packed messages if there is text following them 
+STR_DELIM = b"-\n-"  # Located @ end of packed messages if there is text following them
 PICO_RX_INDEX = 0x21
 hash = crc8.crc8()
 
