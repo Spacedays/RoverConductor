@@ -3,7 +3,7 @@
 
 #### A simple keyboard interface to the rover
 
-import ast
+# import ast
 import contextlib
 import logging
 import queue
@@ -14,7 +14,7 @@ import re
 
 import click
 import msgpack
-from msgpack import Packer, Unpacker
+from msgpack import Packer, Unpacker, OutOfData
 
 from console_input import ThreadedKeyboardInput
 from pico_interface import (
@@ -58,12 +58,15 @@ def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = Non
     txQueue.put(bytemsg)
 
 
+base_packet = ControlPacket(True, True, 125, 126)
+
+
 def msgpack_console():
     # rx_bytes = bytearray(128)
     unpacker = Unpacker()
     packer = Packer()
     PSer = PicoSerial(logQue)
-    kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt))
+    kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt, base_packet))
     while True:
         first_print = True
         with contextlib.suppress(queue.Empty):  # and PSer is not None:
@@ -78,8 +81,8 @@ def msgpack_console():
         if not first_print:
             kthread.toggle_silence()
 
-        for o in unpacker:
-            rxQueue.put(o)
+        # for o in unpacker:
+        #     rxQueue.put(o)
 
         try:
             parse_messages(unpacker, PSer.port.read(PSer.port.in_waiting))
@@ -88,26 +91,27 @@ def msgpack_console():
             print("-" * 78)
             click.echo(bytes(traceback.format_exc(), "utf-8"), err=True)
             # print(traceback.format_exc())
-            click.echo(
-                interactive_parse(
-                    e.__cause__.args[0] if e and e.__cause__ and e.__cause__.args else e
-                ),
-                err=True,
-            )
+            # click.echo(
+            #     interactive_parse(
+            #         e.__cause__.args[0] if e and e.__cause__ and e.__cause__.args else e
+            #     ),
+            #     err=True,
+            # )
             # click.echo(click.wrap_text(e,initial_indent="",subsequent_indent="  ",preserve_paragraphs=True))
             # click.echo(mbytes, err=True)
             # click.echo("-"*78, err=True)
 
         obj = None
         first_print = True  # silence input while printing
-        with contextlib.suppress(queue.Empty):
-            for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
-                if obj is None:
-                    continue
-                if first_print:
-                    kthread.toggle_silence()
-                    first_print = False
-                click.echo(f"~RX:{obj}\r")
+        if rxQueue.qsize() != 0:
+            with contextlib.suppress(queue.Empty):
+                for obj in iter(lambda: rxQueue.get(block=True, timeout=0.01), None):
+                    if obj is None:
+                        break
+                    if first_print:
+                        kthread.toggle_silence()
+                        first_print = False
+                    click.echo(f"~RX({rxQueue.qsize()}):{obj}\r")
         if not first_print:
             kthread.toggle_silence()
         if kthread.exc_info:
@@ -117,50 +121,73 @@ def msgpack_console():
             raise kthread.exc_info[1].with_traceback(kthread.exc_info[2])
 
 
-def parse_messages(unpacker: Unpacker, rx_bytes: bytearray):
-    messages = re.split(PACKETDELIM, rx_bytes)  # does not include termseq separator in list
-    if len(messages) == 0:
-        return
+def isolate_msgpacket(mbytes: bytearray) -> tuple[bytearray, object, int]:
+    """Extract a single message packet from data.
 
-    if messages[0] == b"":
-        del messages[0]
-        if len(messages) == 0:
+    Returns data prior to the message, the object (if any), and the index of any remaining data (-1 if none)"""
+
+    start_idx = mbytes.find(PACKETDELIM)
+    if start_idx == -1:
+        return (mbytes, None, len(mbytes))
+
+    prefix_data = mbytes[:start_idx]
+    obj = None
+
+    # if there's another message, get its start idx in case of an extraction error.
+    # Otherwise, set fin_idx to end
+    fin_idx = mbytes.find(PACKETDELIM, start_idx + len(PACKETDELIM))
+    if fin_idx == -1:
+        fin_idx = len(mbytes)
+
+    # if LEN_SEP cannot be found, received an invalid packet
+    if mbytes.find(LEN_SEP) < 0:
+        return (mbytes[:fin_idx], None, fin_idx)
+
+    # grab packet length & extract packet
+    len_match = re.search(b"([0-9]+)", mbytes)
+    try:
+        packlen = int(mbytes[len(PACKETDELIM) : len_match.span()[1]])
+    except Exception:
+        # could not cast packet length to int; received invalid packet
+        prefix_data = mbytes[:fin_idx]
+        fin_idx = fin_idx
+    else:
+        mstart = len_match.span()[1] + len(LEN_SEP)
+        obj = mbytes[mstart : mstart + packlen]
+
+    return (prefix_data, obj, fin_idx)
+
+
+def parse_messages(unpacker: Unpacker, mbytes: bytearray):
+    """Isolate string and messagepack messages. Assumes messagepack messages are prepended by TERMSEQ, lengthm and LEN_SEP"""
+    more_packed = True
+    while more_packed:
+        prefix_data, obj, fin_idx = isolate_msgpacket(mbytes)
+
+        if prefix_data:
+            rxQueue.put(prefix_data.decode("utf-8", "backslashreplace"))
+        if obj:
+            unpacker.feed(obj)
+            rxQueue.put(obj)  # DEBUG - put message bytes in RX Queue prior to unpacking
+            obj2 = unpacker.unpack()
+            # rxQueue.put(unpacker.unpack())
+            try:
+                rxQueue.put(obj2)
+            except Exception as e:
+                print(f"Exception while unpacking RX message: {obj}")
+                print(e)
+                with contextlib.suppress(OutOfData):
+                    unpacker.skip()
+                rxQueue.put(obj)
+
+        if fin_idx != len(mbytes):
+            mbytes = mbytes[fin_idx:]
+        else:
             return
 
-    for mbytes in messages:
-        idx = -1
-        strmsg = None
-        try:
-            idx = mbytes.find(LEN_SEP)
-            # No separator -> string data
-            if idx < 0:
-                rxQueue.put(mbytes.decode("utf-8", "backslashreplace"))  # escapes escape chars
-            # Separator -> truncate message and process it later as a string
-            elif idx > 0:
-                # get first digit and use it as the message length
-                m = re.search(b"([0-9]+)", mbytes)
-                mlen = int(mbytes[: m.span()[1]])
-                mstart = m.span()[1] + len(b"~")
-                mbytes = mbytes[mstart : mstart + mlen]
-                strmsg = mbytes[mstart + mlen :]
-        except Exception as e:
-            # click.echo("\r\nException raised while parsing string!",err=True)#\r\n\t{e}", err=True)
-            print("\r\nException raised while parsing string!", end="\r\n")
-            e.__cause__ = BaseException(mbytes)
-            # root.exception("Logging - Failed reading string", e)  #TODO
-            raise e
 
-        if idx < 0:
-            continue
-
-        unpacker.feed(mbytes)
-        rxQueue.put(mbytes)
-        rxQueue.put(unpacker.unpack())
-        if strmsg:
-            rxQueue.put(strmsg.decode("utf-8", "backslashreplace"))
-
-
-#TODO: improve / replace / remove
+# TODO: improve / replace / remove
+"""
 def interactive_parse(packedmsg: bytearray):
     click.echo(f"Parsing: {packedmsg}")
     if not click.confirm(f"Unpacking failed. Try again manually?\r{packedmsg}", default=False):
@@ -173,7 +200,7 @@ def interactive_parse(packedmsg: bytearray):
             )
             if ans == "strsearch":
                 s: str = click.prompt("Enter the string to search for")
-                click.echo(f"\t{packedmsg.find(bytes(s, encoding="utf-8"))}")
+                click.echo(f"\t{packedmsg.find(bytes(s, encoding='utf-8'))}")
 
             elif ans == "int":
                 i = int(click.prompt("Enter the starting index of the int"))
@@ -183,7 +210,7 @@ def interactive_parse(packedmsg: bytearray):
             elif ans == "str":
                 i = int(click.prompt("Enter the starting index of the string"))
                 j = int(click.prompt("Enter the length of the string"))
-                click.echo(f"\t{packedmsg[i:i+j].decode("utf-8","backslashreplace")}")
+                click.echo(f"\t{packedmsg[i:i+j].decode('utf-8','backslashreplace')}")
 
             elif ans == "bytestrsearch":
                 s = click.prompt("Enter the bytestring to eval & search: ")
@@ -204,6 +231,7 @@ def interactive_parse(packedmsg: bytearray):
             raise e
         except Exception as e:
             click.echo(f"Command failed: {e}")
+"""
 
 if __name__ == "__main__":
     msgpack_console()
