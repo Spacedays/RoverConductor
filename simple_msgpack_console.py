@@ -7,23 +7,19 @@
 import contextlib
 import logging
 import queue
-from logging.handlers import QueueHandler  # LATER -- use & test logs
-from logging.handlers import QueueListener
-import traceback
 import re
+import traceback
+from logging.handlers import (
+    QueueHandler,  # LATER -- use & test logs
+    QueueListener,
+)
 
 import click
 import msgpack
-from msgpack import Packer, Unpacker, OutOfData
+from msgpack import OutOfData, Packer, Unpacker
 
 from console_input import ThreadedKeyboardInput
-from pico_interface import (
-    PACKETDELIM,
-    LEN_SEP,
-    ControlPacket,
-    PacketMsg,
-    PicoSerial,
-)
+from pico_interface import LEN_SEP, PACKETDELIM, ControlPacket, WrapMsgPack, PicoSerial
 
 logQue = queue.Queue(-1)  # no max size; if max size, prep for queue full exception
 log_queue_handler = QueueHandler(logQue)  # accepts logging messages to allow seperate threads
@@ -49,16 +45,27 @@ txQueue = queue.Queue(-1)
 rxQueue = queue.Queue(-1)
 
 
-def string_to_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
+def send_data_packet(
+    packer: Packer, a: bool = False, b: bool = False, rt: int = 0, ljx: int = 0, ljy: int = 0
+):
+    msg = ControlPacket(a, b, rt, ljx, ljy)
+    return WrapMsgPack(packer, msg.to_iter())
+    # bytemsg = WrapMsgPack(packer, msg.to_iter())
+    # click.echo(f'Packed {msg} to\r\n\t{packer.pack(msg.to_iter())} as\r\n\t{bytemsg}')    #DEBUG
+    # txQueue.put(bytemsg)
+
+
+def send_string_packet(packer: Packer, text: str, base_packet: ControlPacket = None):
     click.echo(f"  Writing {text} into control packet\r")
     msg = ControlPacket() if base_packet is None else base_packet
     msg.s = text  # bytes(text, "utf-8")
-    bytemsg = PacketMsg(packer, msg.to_iter())
+    return WrapMsgPack(packer, msg.to_iter())
+    # bytemsg = WrapMsgPack(packer, msg.to_iter())
     # click.echo(f'Packed {msg} to\r\n\t{packer.pack(msg.to_iter())} as\r\n\t{bytemsg}')    #DEBUG
-    txQueue.put(bytemsg)
+    # txQueue.put(bytemsg)
 
 
-base_packet = ControlPacket(True, True, 125, 126)
+base_packet = ControlPacket(True, True, 0, 125, 126)
 
 
 def msgpack_console():
@@ -66,7 +73,9 @@ def msgpack_console():
     unpacker = Unpacker()
     packer = Packer()
     PSer = PicoSerial(logQue)
-    kthread = ThreadedKeyboardInput(lambda txt: string_to_packet(packer, txt, base_packet))
+    kthread = ThreadedKeyboardInput(
+        lambda txt: txQueue.put(send_string_packet(packer, txt, base_packet))
+    )
     while True:
         first_print = True
         with contextlib.suppress(queue.Empty):  # and PSer is not None:

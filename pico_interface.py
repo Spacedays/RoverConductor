@@ -29,7 +29,7 @@ PICO_RX_INDEX = 0x21
 #     return b"".join([PICO_RX_INDEX.to_bytes(), bytedata, hash.digest()])
 
 
-def PacketMsg(packer: msgpack.Packer, data):
+def WrapMsgPack(packer: msgpack.Packer, data):
     """Wrap the bytes with a start character and length"""
     bytedata = packer.pack(data)
     return b"".join((PACKETDELIM, bytes(str(len(bytedata)), "utf-8"), LEN_SEP, bytedata))
@@ -53,15 +53,15 @@ class ControlPacket:
     # lb: bool = False
     # rb: bool = False
     # lt: int = 0
-    # rt: int = 0
-    ljx: int = 0
+    rt: int = 0
+    ljx: int = 0    # -32,767 to 32,767
     ljy: int = 0
     # rjx: int = 0
     # rjy: int = 0
     s: str = ""
 
     def to_iter(self):
-        return (self.a, self.b, self.ljx, self.ljy, self.s)
+        return (self.a, self.b, self.rt, self.ljx, self.ljy, self.s)
 
 
 class PicoSerial:
