@@ -3,19 +3,18 @@ import contextlib
 import queue
 import traceback
 
+import numpy as np
+import pyqtgraph as pg
 from msgpack import Packer, Unpacker
-from PySide6 import QtCore, QtWidgets, QtGui
+from pyqtgraph import PlotDataItem, PlotWidget
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtSerialPort import QSerialPort
 
-# import PySide6.QtAsyncio as QtAsyncio
-from qasync import QEventLoop, QApplication
-import pyqtgraph as pg
-from pyqtgraph import PlotWidget, PlotDataItem
-import numpy as np
+# import PySide6.QtAsyncio as QtAsyncio     # doesn't support the task used to read the controller yet
+from qasync import QApplication, QEventLoop
 
-from simple_msgpack_console import parse_messages, send_data_packet, rxQueue
-from gamepad import Gamepad, JOY_MID
-
+from gamepad import JOY_MID, Gamepad
+from simple_msgpack_console import parse_messages, rxQueue, send_data_packet
 
 unpacker = Unpacker()
 packer = Packer()
@@ -72,14 +71,9 @@ class MainWindow(QtWidgets.QWidget):
         hlay.setStretch(0, 4)
         hlay.setStretch(1, 3)
         lay.addLayout(hlay)
-        # conn_controller = QtGui.QAction(self, "Connect &Gamepad",)
-        # conn_controller.triggered.connect(self.controller.connect)
-        # toolbar.addAction(conn_controller)
-        # self.start()
-        QtCore.QTimer.singleShot(100, self.start)
 
-    # def showEvent(self, ev):
-    #     self.start()
+    def showEvent(self, ev):
+        QtCore.QTimer.singleShot(100, self.start)
 
     def update(
         self,
@@ -92,11 +86,9 @@ class MainWindow(QtWidgets.QWidget):
                 self.lines.append(
                     self.pw.plot(self.data[idx], pen=self.cmap_table[idx], name=f"Data {idx}")
                 )
-            # print(idx, self.tick, vardata)
             self.data[idx][self.tick] = vardata
         self.pw.setXRange(self.tick - 100, self.tick - 0.05 * 100, padding=0.05)
-        # self.pw.autoRange()
-        # print(self.tick)
+
         self.tick += 1
         if self.tick >= 1000:
             self.tick = 0
@@ -106,11 +98,12 @@ class MainWindow(QtWidgets.QWidget):
         for idx, name in enumerate(names_list[: len(self.data)]):
             self.legend.addItem(self.lines[idx], name)
 
-    def start(self, state):
+    def start(self, state=False):
         if self.running:
             print("Gamepad disabled")
             self.running = False
-            self.controller_toggle.setChecked(False)
+            with QtCore.QSignalBlocker(self.controller_toggle):
+                self.button.setChecked(False)
             self.controller_toggle.setText("Connect &Gamepad")
             return
         try:
@@ -128,7 +121,8 @@ class MainWindow(QtWidgets.QWidget):
             self._task_set.add(data_update)
             data_update.add_done_callback(self.check_exceptions)
 
-            self.controller_toggle.setChecked(True)
+            with QtCore.QSignalBlocker(self.controller_toggle):
+                self.controller_toggle.setChecked(True)
             self.controller_toggle.setText("Disconnect &Gamepad")
 
             # res = asyncio.gather(self.controller.read_gamepad_input(), self.update_data())
@@ -227,11 +221,11 @@ class SerialConsoleWidget(QtWidgets.QWidget):
     # @QtCore.pyqtSlot()
     def send(self):
         if self.serial.isOpen():
-            print("T~", self.serial.write(self.message_le.text().encode()))
+            self.serial.write(self.message_le.text().encode())
 
     def send_raw(self, rawdata):
         if self.serial.isOpen():
-            print("T~", self.serial.write(rawdata))
+            self.serial.write(rawdata)
 
     # @QtCore.pyqtSlot(bool)
     def on_toggled(self, checked):
@@ -278,13 +272,5 @@ if __name__ == "__main__":
     w = MainWindow(g)
     w.show()
 
-    # sys.exit(app.exec())
-    # QtAsyncio.run(w.start())
-    # except Exception as e:
-    #     print(f"Exception! {e}")
     with event_loop:
-        # f = w.start()
-        # event_loop.call_later(w.start())
-        # event_loop.run_forever()
-        # event_loop.create_task(w.start())
         event_loop.run_until_complete(app_close_event.wait())
