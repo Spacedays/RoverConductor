@@ -45,7 +45,7 @@ txQueue = queue.Queue(-1)
 rxQueue = queue.Queue(-1)
 
 
-def send_data_packet(
+def get_data_packet(
     packer: Packer, a: bool = False, b: bool = False, rt: int = 0, ljx: int = 0, ljy: int = 0
 ):
     msg = ControlPacket(a, b, rt, ljx, ljy)
@@ -193,54 +193,6 @@ def parse_messages(unpacker: Unpacker, mbytes: bytearray):
             mbytes = mbytes[fin_idx:]
         else:
             return
-
-
-# TODO: improve / replace / remove
-"""
-def interactive_parse(packedmsg: bytearray):
-    click.echo(f"Parsing: {packedmsg}")
-    if not click.confirm(f"Unpacking failed. Try again manually?\r{packedmsg}", default=False):
-        return
-    while True:
-        try:
-            ans = click.prompt(
-                "What would you like to parse?",
-                type=click.Choice(("int", "str", "strsearch", "bytestrsearch", "unpack", "quit")),
-            )
-            if ans == "strsearch":
-                s: str = click.prompt("Enter the string to search for")
-                click.echo(f"\t{packedmsg.find(bytes(s, encoding='utf-8'))}")
-
-            elif ans == "int":
-                i = int(click.prompt("Enter the starting index of the int"))
-                j = int(click.prompt("Enter the length of the int"))
-                click.echo(f"\t{int.from_bytes(packedmsg[i:i+j])}")
-
-            elif ans == "str":
-                i = int(click.prompt("Enter the starting index of the string"))
-                j = int(click.prompt("Enter the length of the string"))
-                click.echo(f"\t{packedmsg[i:i+j].decode('utf-8','backslashreplace')}")
-
-            elif ans == "bytestrsearch":
-                s = click.prompt("Enter the bytestring to eval & search: ")
-                b = ast.literal_eval(s)
-                click.echo(f"\t{packedmsg.find(b)}")
-
-            elif ans == "unpack":
-                click.echo()
-                i = int(click.prompt("Enter the starting index of the packed message", type=int))
-                j = int(click.prompt("Enter the length of the packed message", type=int))
-                obj = msgpack.unpackb(packedmsg[i : i + j])
-                click.echo(f"\t{obj}")
-
-            elif ans == "quit":
-                break
-
-        except KeyboardInterrupt as e:
-            raise e
-        except Exception as e:
-            click.echo(f"Command failed: {e}")
-"""
 
 if __name__ == "__main__":
     msgpack_console()

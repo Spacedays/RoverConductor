@@ -13,12 +13,15 @@ from PySide6.QtSerialPort import QSerialPort
 # import PySide6.QtAsyncio as QtAsyncio     # doesn't support the task used to read the controller yet
 from qasync import QApplication, QEventLoop
 
-from gamepad import Gamepad
+from gamepad import Gamepad, GamepadState
 from simple_msgpack_console import parse_messages, rxQueue, get_data_packet
 from pico_interface import ControlPacket, MotionVector, calc_steer_center, calc_motion_vec
 from pico_interface import RCONST
 
 from typing import Dict, Tuple
+
+import pyjoystick
+from pyjoystick.sdl2 import Key, Joystick, run_event_loop
 
 unpacker = Unpacker()
 packer = Packer()
@@ -44,12 +47,13 @@ async def shutdown_signal(signal, loop):
 
 
 def wheel_angles_to_pg(*args):
-# wheel angles have CCW (+), with 0 degrees in the +Y direction
-# pg angles have CW (+), with 0 degrees in the -X direction
+    # wheel angles have CCW (+), with 0 degrees in the +Y direction
+    # pg angles have CW (+), with 0 degrees in the -X direction
     return [-arg for arg in args]
 
-class MainWindow(QtWidgets.QWidget):
-    def __init__(self, controller: Gamepad):
+
+class ControlWindow(QtWidgets.QWidget):
+    def __init__(self, controller: Gamepad|GamepadState=None):
         super().__init__()
 
         self.pw = PlotWidget(self)
@@ -59,7 +63,8 @@ class MainWindow(QtWidgets.QWidget):
         self.lines: PlotDataItem = []
         self.tick: int = 0  # wraps from 0-1000
         self.ticksize: float = 0.05
-        self.controller = controller
+      #   self.controller = controller
+        self.controller = GamepadState()
         self.controller_toggle = QtWidgets.QToolButton()
         self.running = False
         self.console = SerialConsoleWidget()
@@ -68,12 +73,22 @@ class MainWindow(QtWidgets.QWidget):
         self.sc = pg.TargetItem
         self._task_set = set()
 
+        self.controller_mgr = pyjoystick.ThreadEventManager(event_loop=run_event_loop,
+                                     remove_joystick=self.stop,
+                                     handle_key_event=self.controller.handle_key_event,
+                                     button_repeater=None)
+
+			#TODO: handle controller connection
+        
+        self.control_update = QtCore.QTimer(self)
+        self.control_update.timeout.connect(self.update_data)
+
         lay = QtWidgets.QVBoxLayout(self)
         toolbar = QtWidgets.QToolBar()
         toolbar.addWidget(self.controller_toggle)
         self.controller_toggle.setText("Connect &Gamepad")
         self.controller_toggle.setCheckable(True)
-        self.controller_toggle.toggled.connect(self.start)
+        self.controller_toggle.toggled.connect(self.startcontrol)
         lay.addWidget(toolbar)
 
         hlay = QtWidgets.QHBoxLayout()
@@ -90,8 +105,11 @@ class MainWindow(QtWidgets.QWidget):
         lay.addLayout(hlay)
 
         self._roverdisp_setup()
+        self.update_plot(*[0, 0, 0, 0])
+        self.set_names(["ljx", "ljy", "rjx", "rt"])
 
     def _roverdisp_setup(self):
+        """Displays arrows for rover wheel directions"""
         self.arrows = {"FL": None, "FR": None, "BL": None, "BR": None}
         pos = {
             "FL": (-RCONST.SCDX, RCONST.SCDY),
@@ -123,7 +141,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sc.setPos(*sc)
 
     def showEvent(self, ev):
-        QtCore.QTimer.singleShot(100, self.start)
+        QtCore.QTimer.singleShot(100, self.startcontrol)
 
     def update_plot(
         self,
@@ -133,9 +151,7 @@ class MainWindow(QtWidgets.QWidget):
             if idx >= len(self.data):
                 self.data.append(np.zeros(1000))
                 self.data[idx][self.tick] = vardata
-                self.lines.append(
-                    self.pw.plot(self.data[idx], pen=self.cmap_table[idx], name=f"Data {idx}")
-                )
+                self.lines.append(self.pw.plot(self.data[idx], pen=self.cmap_table[idx], name=f"Data {idx}"))
             self.data[idx][self.tick] = vardata
         self.pw.setXRange(self.tick - 100, self.tick - 0.05 * 100, padding=0.05)
 
@@ -148,96 +164,86 @@ class MainWindow(QtWidgets.QWidget):
         for idx, name in enumerate(names_list[: len(self.data)]):
             self.legend.addItem(self.lines[idx], name)
 
-    def start(self, state=False):
+    def startcontrol(self, state=False):
+        """If a gamepad is connected, start updating the UI and controller objects"""
         if self.running:
-            print("Gamepad disabled")
-            self.running = False
-            with QtCore.QSignalBlocker(self.controller_toggle):
-                self.controller_toggle.setChecked(False)
-            self.controller_toggle.setText("Connect &Gamepad")
+            return self.stop()
+            # pyjoystick.sdl2.quit()
+        # pyjoystick.sdl2.init()
+
+        #TODO: handle adding & removing joystick
+        devices = Joystick.get_joysticks()
+        if not devices:
+            print("No gamepad found")
             return
-        try:
-            self.loop = asyncio.get_event_loop()
-            print("Starting updates")
-            if not self.controller and not self.controller.connect():
-                return
-            self.running = True
 
-            gamepad_inp = asyncio.create_task(self.controller.read_gamepad_input())
-            self._task_set.add(gamepad_inp)
-            gamepad_inp.add_done_callback(self.check_exceptions)
+        print("Devices:")
+        for joy in devices:
+            print('\t', f'{joy.get_id()}.', joy.get_name())
+        self.controller_mgr.start()
+        self.control_update.start(self.ticksize)
 
-            data_update = asyncio.create_task(self.update_data())
-            self._task_set.add(data_update)
-            data_update.add_done_callback(self.check_exceptions)
+        with QtCore.QSignalBlocker(self.controller_toggle):
+            self.controller_toggle.setChecked(True)
+        self.controller_toggle.setText("Disconnect &Gamepad")
+        self.running = True
 
-            with QtCore.QSignalBlocker(self.controller_toggle):
-                self.controller_toggle.setChecked(True)
-            self.controller_toggle.setText("Disconnect &Gamepad")
+    def stop(self):
+        print("Gamepad disabled")
+        self.running = False
+        with QtCore.QSignalBlocker(self.controller_toggle):
+            self.controller_toggle.setChecked(False)
+        self.controller_toggle.setText("Connect &Gamepad")
 
-        except Exception as e:
-            print(f"Loop Exception! {e}")
-            raise e
+        self.controller_mgr.stop()
+        if self.control_update.isActive():
+            self.control_update.stop()
 
-    # not here
-    async def update_data(self):
-        self.update_plot(*[0, 0, 0, 0])
-        self.set_names(["ljx", "ljy", "rjx", "rt"])
-        while self.running and self.controller:
-            vals = [
+    def update_data(self):
+        vals = [
+            self.controller.joystick_left_x,
+            self.controller.joystick_left_y,
+            self.controller.joystick_right_x,
+            self.controller.trigger_right,
+        ]
+        # vals = [val / JOY_MID for val in vals]
+        # print(vals)
+        self.update_plot(*vals)
+        for idx, datal in enumerate(self.lines):
+            datal.setData(self.data[idx])
+
+        # self.console.send_raw(
+        #     get_data_packet(
+        #         packer,
+        #         self.controller.button_a,
+        #         self.controller.button_b,
+        #         self.controller.trigger_right,
+        #         self.controller.joystick_left_x,
+        #         self.controller.joystick_left_y,
+        #     )
+        # )
+
+        d, h = calc_steer_center(self.controller.joystick_left_x, self.controller.joystick_left_y)
+        # d = self.controller.joystick_left_x/160
+        # h = self.controller.joystick_left_y/160
+        mvec = calc_motion_vec(
+            ControlPacket(
+                self.controller.button_a,
+                self.controller.button_b,
+                self.controller.trigger_right,
                 self.controller.joystick_left_x,
                 self.controller.joystick_left_y,
-                self.controller.joystick_right_x,
-                self.controller.trigger_right,
-            ]
-            # vals = [val / JOY_MID for val in vals]
-            # print(vals)
-            self.update_plot(*vals)
-            for idx, datal in enumerate(self.lines):
-                datal.setData(self.data[idx])
+            ),
+            d,
+            h,
+        )
+        angles = mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR
+        print(angles, f"({d:.2f} {h:.2f})")
+        angles = wheel_angles_to_pg(*angles)
+        # self.update_motion_vector(mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR, (d, h))
+        self.update_motion_vector(*angles, (d, h))
 
-            # self.console.send_raw(
-            #     get_data_packet(
-            #         packer,
-            #         self.controller.button_a,
-            #         self.controller.button_b,
-            #         self.controller.trigger_right,
-            #         self.controller.joystick_left_x,
-            #         self.controller.joystick_left_y,
-            #     )
-            # )
-
-            d, h = calc_steer_center(
-                self.controller.joystick_left_x, self.controller.joystick_left_y
-            )
-            # d = self.controller.joystick_left_x/160
-            # h = self.controller.joystick_left_y/160
-            mvec = calc_motion_vec(
-                ControlPacket(
-                    self.controller.button_a,
-                    self.controller.button_b,
-                    self.controller.trigger_right,
-                    self.controller.joystick_left_x,
-                    self.controller.joystick_left_y,
-                ),
-                d,
-                h,
-            )
-            angles = mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR
-            print(angles, f"({d:.2f} {h:.2f})")
-            angles = wheel_angles_to_pg(*angles)
-            # self.update_motion_vector(mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR, (d, h))
-            self.update_motion_vector(*angles, (d, h))
-
-
-            await asyncio.sleep(self.ticksize)
-        print("Done running!")
-
-    async def catch_interrupts(self):
-        signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
-        for s in signals:
-            sigtask = self._task_set.add(asyncio.create_task(shutdown_signal(s, self.loop)))
-            self.loop.add_signal_handler(s, sigtask)
+        # await asyncio.sleep(self.ticksize)
 
     def check_exceptions(self, task):
         print(f"Closed {task}")
@@ -258,9 +264,7 @@ class SerialConsoleWidget(QtWidgets.QWidget):
         self.message_le = QtWidgets.QLineEdit()
         self.send_btn = QtWidgets.QPushButton(text="Send", clicked=self.send)
         self.output_te = QtWidgets.QTextEdit(readOnly=True)
-        self.button = QtWidgets.QPushButton(
-            text="Connect Serial", checkable=True, toggled=self.on_toggled
-        )
+        self.button = QtWidgets.QPushButton(text="Connect Serial", checkable=True, toggled=self.on_toggled)
         lay = QtWidgets.QVBoxLayout(self)
         hlay = QtWidgets.QHBoxLayout()
         hlay.addWidget(self.message_le)
@@ -332,18 +336,13 @@ if __name__ == "__main__":
     import sys
 
     app = QApplication(sys.argv)
-    event_loop = QEventLoop(app)
-    asyncio.set_event_loop(event_loop)
-    app_close_event = asyncio.Event()
-    app.aboutToQuit.connect(app_close_event.set)
-    # app = QtWidgets.QApplication(sys.argv)
 
     # w = SerialConsoleWidget()
 
     # try:
-    g = Gamepad()
-    w = MainWindow(g)
+   #  g = Gamepad()
+   #  w = MainWindow(g)
+    w = ControlWindow()
     w.show()
-
-    with event_loop:
-        event_loop.run_until_complete(app_close_event.wait())
+    
+    app.exec()
