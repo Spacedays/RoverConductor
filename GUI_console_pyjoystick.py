@@ -1,4 +1,6 @@
-import asyncio
+# from time import perf_counter
+# import time
+
 import contextlib
 import queue
 import traceback
@@ -8,12 +10,13 @@ import pyqtgraph as pg
 from msgpack import Packer, Unpacker
 from pyqtgraph import PlotDataItem, PlotWidget
 from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtWidgets import QApplication
 from PySide6.QtSerialPort import QSerialPort
 
 # import PySide6.QtAsyncio as QtAsyncio     # doesn't support the task used to read the controller yet
-from qasync import QApplication, QEventLoop
+# from qasync import QApplication, QEventLoop
 
-from gamepad import Gamepad, GamepadState
+from gamepad import GamepadState
 from simple_msgpack_console import parse_messages, rxQueue, get_data_packet
 from pico_interface import ControlPacket, MotionVector, calc_steer_center, calc_motion_vec
 from pico_interface import RCONST
@@ -27,62 +30,58 @@ unpacker = Unpacker()
 packer = Packer()
 
 
-async def removetasks(loop):
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-
-    for task in tasks:
-        # skipping over shielded coro still does not help
-        if task._coro.__name__ == "cant_stop_me":
-            continue
-        task.cancel()
-
-    print("Cancelling outstanding tasks")
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
-
-
-async def shutdown_signal(signal, loop):
-    print(f"Received exit signal {signal.name}...")
-    await removetasks(loop)
-
-
 def wheel_angles_to_pg(*args):
+    """Convert wheel-oriented angles to plot axis-oriented angles for graphing"""
     # wheel angles have CCW (+), with 0 degrees in the +Y direction
     # pg angles have CW (+), with 0 degrees in the -X direction
     return [-arg for arg in args]
 
 
 class ControlWindow(QtWidgets.QWidget):
-    def __init__(self, controller: Gamepad|GamepadState=None):
+    def __init__(self):
         super().__init__()
 
-        self.pw = PlotWidget(self)
-        self.cmap_table = pg.colormap.get("CET-C2").getLookupTable(nPts=6)
-        self.legend = self.pw.addLegend()
-        self.data = []
-        self.lines: PlotDataItem = []
         self.tick: int = 0  # wraps from 0-1000
-        self.ticksize: float = 0.05
-      #   self.controller = controller
-        self.controller = GamepadState()
+        self.ticksize: float = 0.01  # rate for controller value & GUI updates
+        self.ctrlstate = GamepadState()
         self.controller_toggle = QtWidgets.QToolButton()
+        self.ctrlpacket = ControlPacket()
         self.running = False
+        #   self.controller = controller
+
+        ## data plot
+        self.dataplot = PlotWidget(self)  # data plot
+
+        ## serial console
         self.console = SerialConsoleWidget()
+
+        ## rover motion display
         self.rdisp = pg.PlotWidget()
         self.arrows: Dict[str : pg.ArrowItem] = None
         self.sc = pg.TargetItem
-        self._task_set = set()
 
-        self.controller_mgr = pyjoystick.ThreadEventManager(event_loop=run_event_loop,
-                                     remove_joystick=self.stop,
-                                     handle_key_event=self.controller.handle_key_event,
-                                     button_repeater=None)
+        self.controller_mgr = pyjoystick.ThreadEventManager(
+            event_loop=run_event_loop,
+            remove_joystick=self.stop,
+            handle_key_event=self.ctrlstate.handle_key_event,
+            button_repeater=None,
+        )
+        # TODO: handle controller connection/disconnection
 
-			#TODO: handle controller connection
-        
+        ## TImers
         self.control_update = QtCore.QTimer(self)
         self.control_update.timeout.connect(self.update_data)
+        # interval: ticksize
 
+        self.plot_update = QtCore.QTimer(self)
+        self.plot_update.timeout.connect(self.update_ctrlplot_data)
+        # interval: ticksize
+
+        self.ctrlpacket_timer = QtCore.QTimer(self)
+        self.ctrlpacket_timer.timeout.connect(self.send_ctrlpacket)
+        self.packet_interval = 0.025  # 40 Hz
+
+        ## gamepad toggle
         lay = QtWidgets.QVBoxLayout(self)
         toolbar = QtWidgets.QToolBar()
         toolbar.addWidget(self.controller_toggle)
@@ -91,9 +90,10 @@ class ControlWindow(QtWidgets.QWidget):
         self.controller_toggle.toggled.connect(self.startcontrol)
         lay.addWidget(toolbar)
 
+        ## Graphics layout setup
         hlay = QtWidgets.QHBoxLayout()
-        hlay.addWidget(self.pw)
-        self.pw.setMinimumWidth(400)
+        hlay.addWidget(self.dataplot)
+        self.dataplot.setMinimumWidth(400)
 
         vlay = QtWidgets.QVBoxLayout()
         vlay.addWidget(self.rdisp)
@@ -104,9 +104,11 @@ class ControlWindow(QtWidgets.QWidget):
         hlay.setStretch(1, 3)
         lay.addLayout(hlay)
 
+        ## first-time setup
+        self._dataplot_setup()
         self._roverdisp_setup()
         self.update_plot(*[0, 0, 0, 0])
-        self.set_names(["ljx", "ljy", "rjx", "rt"])
+        self.set_linenames(["ljx", "ljy", "rjx", "rt"])
 
     def _roverdisp_setup(self):
         """Displays arrows for rover wheel directions"""
@@ -131,7 +133,16 @@ class ControlWindow(QtWidgets.QWidget):
         self.rdisp.setXRange(min=RCONST.SCDX * -15, max=RCONST.SCDX * 15)
         self.rdisp.setYRange(min=RCONST.SCDY * -15, max=RCONST.SCDY * 15)
 
+    def _dataplot_setup(self):
+        self.data = []
+        self.lines: PlotDataItem = []
+        self.legend = self.dataplot.addLegend()
+        self.cmap_table = pg.colormap.get("CET-C2").getLookupTable(nPts=6)
+        self.dataplot.setDownsampling(mode="peak")
+        self.dataplot.setClipToView(True)
+
     def update_motion_vector(self, FL: int, FR: int, BL: int, BR: int, sc: Tuple[int, int]):
+        """Sets steering center for rover motion display"""
         offset = 90
         self.arrows["FL"].setStyle(angle=FL + offset)
         self.arrows["FR"].setStyle(angle=FR + offset)
@@ -143,23 +154,7 @@ class ControlWindow(QtWidgets.QWidget):
     def showEvent(self, ev):
         QtCore.QTimer.singleShot(100, self.startcontrol)
 
-    def update_plot(
-        self,
-        *data,
-    ):
-        for idx, vardata in enumerate(data):
-            if idx >= len(self.data):
-                self.data.append(np.zeros(1000))
-                self.data[idx][self.tick] = vardata
-                self.lines.append(self.pw.plot(self.data[idx], pen=self.cmap_table[idx], name=f"Data {idx}"))
-            self.data[idx][self.tick] = vardata
-        self.pw.setXRange(self.tick - 100, self.tick - 0.05 * 100, padding=0.05)
-
-        self.tick += 1
-        if self.tick >= 1000:
-            self.tick = 0
-
-    def set_names(self, names_list):
+    def set_linenames(self, names_list):
         self.legend.clear()
         for idx, name in enumerate(names_list[: len(self.data)]):
             self.legend.addItem(self.lines[idx], name)
@@ -171,7 +166,7 @@ class ControlWindow(QtWidgets.QWidget):
             # pyjoystick.sdl2.quit()
         # pyjoystick.sdl2.init()
 
-        #TODO: handle adding & removing joystick
+        # TODO: handle adding & removing joystick
         devices = Joystick.get_joysticks()
         if not devices:
             print("No gamepad found")
@@ -179,14 +174,19 @@ class ControlWindow(QtWidgets.QWidget):
 
         print("Devices:")
         for joy in devices:
-            print('\t', f'{joy.get_id()}.', joy.get_name())
+            print("\t", f"{joy.get_id()}.", joy.get_name())
+
+        # Start update timers
         self.controller_mgr.start()
         self.control_update.start(self.ticksize)
+        self.plot_update.start(self.ticksize)
+        self.ctrlpacket_timer.start(self.packet_interval)
 
         with QtCore.QSignalBlocker(self.controller_toggle):
             self.controller_toggle.setChecked(True)
         self.controller_toggle.setText("Disconnect &Gamepad")
         self.running = True
+        # self.start_t = time.time()  # DEBUG perf timer
 
     def stop(self):
         print("Gamepad disabled")
@@ -198,64 +198,71 @@ class ControlWindow(QtWidgets.QWidget):
         self.controller_mgr.stop()
         if self.control_update.isActive():
             self.control_update.stop()
+        if self.plot_update.isActive():
+            self.plot_update.stop()
 
     def update_data(self):
-        vals = [
-            self.controller.joystick_left_x,
-            self.controller.joystick_left_y,
-            self.controller.joystick_right_x,
-            self.controller.trigger_right,
-        ]
-        # vals = [val / JOY_MID for val in vals]
-        # print(vals)
-        self.update_plot(*vals)
-        for idx, datal in enumerate(self.lines):
-            datal.setData(self.data[idx])
-
-        # self.console.send_raw(
-        #     get_data_packet(
-        #         packer,
-        #         self.controller.button_a,
-        #         self.controller.button_b,
-        #         self.controller.trigger_right,
-        #         self.controller.joystick_left_x,
-        #         self.controller.joystick_left_y,
-        #     )
-        # )
-
-        d, h = calc_steer_center(self.controller.joystick_left_x, self.controller.joystick_left_y)
+        self.ctrlpacket = ControlPacket(
+            False, False, 0, self.ctrlstate.joystick_left_x, self.ctrlstate.joystick_left_y
+        )
+        d, h = calc_steer_center(self.ctrlstate.joystick_left_x, self.ctrlstate.joystick_left_y)
         # d = self.controller.joystick_left_x/160
         # h = self.controller.joystick_left_y/160
         mvec = calc_motion_vec(
             ControlPacket(
-                self.controller.button_a,
-                self.controller.button_b,
-                self.controller.trigger_right,
-                self.controller.joystick_left_x,
-                self.controller.joystick_left_y,
+                self.ctrlstate.button_a,
+                self.ctrlstate.button_b,
+                self.ctrlstate.trigger_right,
+                self.ctrlstate.joystick_left_x,
+                self.ctrlstate.joystick_left_y,
             ),
             d,
             h,
         )
         angles = mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR
-        print(angles, f"({d:.2f} {h:.2f})")
+        # print(angles, f"({d:.2f} {h:.2f})")   #DEBUG wheel data
         angles = wheel_angles_to_pg(*angles)
         # self.update_motion_vector(mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR, (d, h))
         self.update_motion_vector(*angles, (d, h))
 
         # await asyncio.sleep(self.ticksize)
 
-    def check_exceptions(self, task):
-        print(f"Closed {task}")
-        self._task_set.remove(task)  # prefer a set than a list -  'remove' gets much better
+    def update_plot(
+        self,
+        *data,
+    ):
+        if len(data) > len(self.data):  # FIXME: handle case where only 1 variable is plotted
+            for new_idx in range(len(data) - len(self.data)):
+                idx = len(self.data)
+                self.data.append(np.zeros(1000))
+                self.data[idx][self.tick] = data[idx]
+                self.lines.append(
+                    self.dataplot.plot(self.data[idx], pen=self.cmap_table[idx], name=f"Data {idx}")
+                )
+        for idx, vardata in enumerate(data):
+            self.data[idx][self.tick] = vardata
+        self.dataplot.setXRange(self.tick - 150, self.tick - 0.05 * 150, padding=0.05)
 
-        try:
-            _ = task.result()
-        except NotImplementedError:
-            print(f"NotImplementedError: {traceback.format_exc()}")
-        except Exception as e:
-            print(f"Exception!\n{traceback.format_exc()}\nquitting...")
-            self.running = False
+        for idx, datal in enumerate(self.lines):
+            datal.setData(self.data[idx])
+
+        self.tick += 1
+        if self.tick >= 1000:
+            self.tick = 0
+
+    def update_ctrlplot_data(self):
+        self.update_plot(
+            self.ctrlstate.joystick_left_x,
+            self.ctrlstate.joystick_left_y,
+            self.ctrlstate.joystick_right_x,
+            self.ctrlstate.trigger_right,
+        )
+        # print("FPS:", 1 / (time.time() - self.start_t))
+        # self.start_t = time.time()  # DEBUG perftimer
+
+    def send_ctrlpacket(self):
+        if self.console.serial and self.console.serial.isOpen:
+            self.console.send_raw(self.ctrlpacket)
 
 
 class SerialConsoleWidget(QtWidgets.QWidget):
@@ -311,10 +318,11 @@ class SerialConsoleWidget(QtWidgets.QWidget):
                 self.serial.clear()
                 self.serial.setDataTerminalReady(True)
                 self.output_te.append(" -- Connected to device --")
-            elif not self.serial.open(QtCore.QIODevice.OpenModeFlag.ReadWrite):
+            # elif not self.serial.open(QtCore.QIODevice.OpenModeFlag.ReadWrite):
+            else:
                 self.button.setChecked(False)
                 self.output_te.append(" !-- Can't open device --!")
-                print("Can't open device!")
+                print("Can't open Serial device!")
         else:
             self.serial.close()
             self.button.setText("Connect Serial")
@@ -332,17 +340,25 @@ class SerialConsoleWidget(QtWidgets.QWidget):
 
 
 if __name__ == "__main__":
-    import signal
     import sys
+
+    # import cProfile           # DEBUG profiling
+    # import pstats
+    # profiler = cProfile.Profile()
+    # profiler.enable()
 
     app = QApplication(sys.argv)
 
     # w = SerialConsoleWidget()
 
     # try:
-   #  g = Gamepad()
-   #  w = MainWindow(g)
+    #  g = Gamepad()
+    #  w = MainWindow(g)
     w = ControlWindow()
     w.show()
-    
+
     app.exec()
+
+    # profiler.disable()
+    # stats = pstats.Stats(profiler)
+    # stats.sort_stats("cumulative").print_stats(10)  # Print top 10 functions by cumulative time
