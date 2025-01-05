@@ -2,20 +2,29 @@ import asyncio
 import contextlib
 import queue
 import traceback
+from time import perf_counter
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtSerialPort import QSerialPort
 
 import numpy as np
 import pyqtgraph as pg
 from msgpack import Packer, Unpacker
 from pyqtgraph import PlotDataItem, PlotWidget
-from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtSerialPort import QSerialPort
 
 # import PySide6.QtAsyncio as QtAsyncio     # doesn't support the task used to read the controller yet
 from qasync import QApplication, QEventLoop
 
 from gamepad import Gamepad
 from simple_msgpack_console import parse_messages, rxQueue, get_data_packet
-from pico_interface import ControlPacket, MotionVector, calc_steer_center, calc_motion_vec
+from pico_interface import (
+    ControlPacket,
+    MotionVector,
+    calc_steer_center,
+    calc_motion_vec,
+    WrapMsgPack,
+    PicoSerial,
+)
 from pico_interface import RCONST
 
 from typing import Dict, Tuple
@@ -44,9 +53,10 @@ async def shutdown_signal(signal, loop):
 
 
 def wheel_angles_to_pg(*args):
-# wheel angles have CCW (+), with 0 degrees in the +Y direction
-# pg angles have CW (+), with 0 degrees in the -X direction
+    # wheel angles have CCW (+), with 0 degrees in the +Y direction
+    # pg angles have CW (+), with 0 degrees in the -X direction
     return [-arg for arg in args]
+
 
 class MainWindow(QtWidgets.QWidget):
     def __init__(self, controller: Gamepad):
@@ -67,6 +77,7 @@ class MainWindow(QtWidgets.QWidget):
         self.arrows: Dict[str : pg.ArrowItem] = None
         self.sc = pg.TargetItem
         self._task_set = set()
+        self.ctrlpacket: ControlPacket = ControlPacket()
 
         lay = QtWidgets.QVBoxLayout(self)
         toolbar = QtWidgets.QToolBar()
@@ -113,6 +124,16 @@ class MainWindow(QtWidgets.QWidget):
         self.rdisp.setXRange(min=RCONST.SCDX * -15, max=RCONST.SCDX * 15)
         self.rdisp.setYRange(min=RCONST.SCDY * -15, max=RCONST.SCDY * 15)
 
+    def set_controller_state(self, state: bool):
+        if state and self.controller:
+            with QtCore.QSignalBlocker(self.controller_toggle):
+                self.controller_toggle.setChecked(True)
+            self.controller_toggle.setText("Disconnect &Gamepad")
+        else:
+            with QtCore.QSignalBlocker(self.controller_toggle):
+                self.controller_toggle.setChecked(False)
+            self.controller_toggle.setText("Connect &Gamepad")
+
     def update_motion_vector(self, FL: int, FR: int, BL: int, BR: int, sc: Tuple[int, int]):
         offset = 90
         self.arrows["FL"].setStyle(angle=FL + offset)
@@ -152,9 +173,7 @@ class MainWindow(QtWidgets.QWidget):
         if self.running:
             print("Gamepad disabled")
             self.running = False
-            with QtCore.QSignalBlocker(self.controller_toggle):
-                self.controller_toggle.setChecked(False)
-            self.controller_toggle.setText("Connect &Gamepad")
+            self.set_controller_state(False)
             return
         try:
             self.loop = asyncio.get_event_loop()
@@ -171,9 +190,11 @@ class MainWindow(QtWidgets.QWidget):
             self._task_set.add(data_update)
             data_update.add_done_callback(self.check_exceptions)
 
-            with QtCore.QSignalBlocker(self.controller_toggle):
-                self.controller_toggle.setChecked(True)
-            self.controller_toggle.setText("Disconnect &Gamepad")
+            message_transmit = asyncio.create_task(self.send_control_packet())
+            self._task_set.add(message_transmit)
+            message_transmit.add_done_callback(self.check_exceptions)
+
+            self.set_controller_state(True)
 
         except Exception as e:
             print(f"Loop Exception! {e}")
@@ -196,42 +217,36 @@ class MainWindow(QtWidgets.QWidget):
             for idx, datal in enumerate(self.lines):
                 datal.setData(self.data[idx])
 
-            # self.console.send_raw(
-            #     get_data_packet(
-            #         packer,
-            #         self.controller.button_a,
-            #         self.controller.button_b,
-            #         self.controller.trigger_right,
-            #         self.controller.joystick_left_x,
-            #         self.controller.joystick_left_y,
-            #     )
-            # )
+            self.ctrlpacket = ControlPacket(
+                self.controller.button_a,
+                self.controller.button_b,
+                int(self.controller.trigger_right * RCONST.TRIGGER_MAX),
+                int(self.controller.joystick_left_x * RCONST.JOY_MAX),
+                int(self.controller.joystick_left_y * RCONST.JOY_MAX),
+            )
+            d, h = calc_steer_center(self.ctrlpacket.ljx, self.ctrlpacket.ljy)
+            mvec = calc_motion_vec(self.ctrlpacket, d, h)
 
-            d, h = calc_steer_center(
-                self.controller.joystick_left_x, self.controller.joystick_left_y
-            )
-            # d = self.controller.joystick_left_x/160
-            # h = self.controller.joystick_left_y/160
-            mvec = calc_motion_vec(
-                ControlPacket(
-                    self.controller.button_a,
-                    self.controller.button_b,
-                    self.controller.trigger_right,
-                    self.controller.joystick_left_x,
-                    self.controller.joystick_left_y,
-                ),
-                d,
-                h,
-            )
             angles = mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR
-            print(angles, f"({d:.2f} {h:.2f})")
+            # print(angles, f"({d:.2f} {h:.2f})")   #DEBUG
             angles = wheel_angles_to_pg(*angles)
             # self.update_motion_vector(mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR, (d, h))
             self.update_motion_vector(*angles, (d, h))
 
-
             await asyncio.sleep(self.ticksize)
         print("Done running!")
+
+    async def send_control_packet(self):
+        last_packet_time = perf_counter()
+        last_packet = ControlPacket()
+        while self.running and self.controller:
+            if self.console.serial.isOpen() and (
+                self.ctrlpacket != last_packet or perf_counter() - last_packet_time > 5
+            ):
+                print(f"TX: {self.ctrlpacket}")
+                self.console.send_raw(WrapMsgPack(packer, self.ctrlpacket.to_iter()))
+                last_packet_time = perf_counter()
+            await asyncio.sleep(5 * self.ticksize)
 
     async def catch_interrupts(self):
         signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
@@ -270,7 +285,8 @@ class SerialConsoleWidget(QtWidgets.QWidget):
         lay.addWidget(self.button)
 
         self.serial = QSerialPort(
-            "/dev/ttyACM0",
+            # "/dev/ttyACM0",
+            PicoSerial.find_pico(),
             baudRate=115200,
             readyRead=self.receive,
             flowControl=QSerialPort.FlowControl.NoFlowControl,

@@ -5,7 +5,7 @@ from pyjoystick import Key, Joystick
 
 import sys
 
-# if Gamepad is used: (Linux only)
+# if evdev Gamepad is used: (Linux only)
 if sys.platform == "linux":
     from evdev import InputDevice, ecodes, ff, list_devices
     # from evdev import InputDevice, categorize, ecodes
@@ -14,19 +14,19 @@ from pico_interface import ControlPacket
 
 
 TRIGGER_MAX = 1023  # LATER: configure this
-JOY_MAX = 0xFFFF / 2
+JOY_MAX = 0x7FFF #0xFFFF / 2
 # JOY_MID = 0xFFFF / 2
 JOY_DEADZONE = 0
 
-
+#The gamepad values are expected to be a -1 to 1 or 0 to 1 float. They should be mapped to integers before transmitting.
 class GamepadState:
     def __init__(self, file=None):
-        self.joystick_left_y = 0  # values are mapped to [-1 ... 1]
-        self.joystick_left_x = 0  # values are mapped to [-1 ... 1]
-        self.joystick_right_x = 0  # values are mapped to [-1 ... 1]
-        self.joystick_right_y = 0  # values are mapped to [-1 ... 1]
-        self.trigger_right = 0  # values are mapped to [0 ... 1]
-        self.trigger_left = 0  # values are mapped to [0 ... 1]
+        self.joystick_left_y = 0
+        self.joystick_left_x = 0
+        self.joystick_right_x = 0
+        self.joystick_right_y = 0
+        self.trigger_right = 0
+        self.trigger_left = 0
         self.button_x = False
         self.button_y = False
         self.button_b = False
@@ -95,7 +95,7 @@ class GamepadState:
 
 
 # Evdev gamepad (Linux only)
-if sys.platform == "linux":
+if sys.platform == "linux": # and False:
 
     class Gamepad(GamepadState):
         def __init__(self, file=None):
@@ -221,18 +221,18 @@ if sys.platform == "linux":
                             case 1:
                                 # print(f"Case 1: {event.value}")
                                 self.joystick_left_y = event.value / JOY_MAX
-                            # right joystick x-axis
+                            # elif event.code == 2:  # left trigger
                             case 2:
+                                self.trigger_left = event.value / TRIGGER_MAX
+                            case 3:
                                 self.joystick_right_x = event.value / JOY_MAX
                             # right joystick y-axis
-                            case 5:
+                            case 4:
                                 self.joystick_right_y = event.value / JOY_MAX
-                            # elif event.code == 2:  # left trigger
-                            case 10:
-                                self.trigger_left = int(event.value)
+                            # right joystick x-axis
                             # elif event.code == 5:  # right trigger
-                            case 9:
-                                self.trigger_right = int(event.value)
+                            case 5:
+                                self.trigger_right = event.value / TRIGGER_MAX
                             # elif event.code == 16:  # right trigger
                             case 16:
                                 if event.value == -1:
@@ -276,74 +276,74 @@ if sys.platform == "linux":
             self.device_file.erase_effect(self.effect1_id)
 
 
-async def controller_test(gamepad: Gamepad):
-    while gamepad.is_connected() and not gamepad.button_b:
-        print()
-        print(
-            f"ljx:{gamepad.joystick_left_x:4.2f} ljy:{gamepad.joystick_left_y:4.2f} rjx:{gamepad.joystick_right_x:4.2f} rjy:{gamepad.joystick_right_y:4.2f} lt:{gamepad.trigger_left:4.2f} rt:{gamepad.trigger_right:4.2f}",
-            end="\r",
-        )
-        # print("\033[A", end='') # move up 1 line
-        await asyncio.sleep(100e-3)  # 100ms
-    print("\ndone")
-    return
+    async def controller_test(gamepad: Gamepad):
+        while gamepad.is_connected() and not gamepad.button_b:
+            print()
+            print(
+                f"ljx:{gamepad.joystick_left_x:4.2f} ljy:{gamepad.joystick_left_y:4.2f} rjx:{gamepad.joystick_right_x:4.2f} rjy:{gamepad.joystick_right_y:4.2f} lt:{gamepad.trigger_left:4.2f} rt:{gamepad.trigger_right:4.2f}",
+                end="\r",
+            )
+            # print("\033[A", end='') # move up 1 line
+            await asyncio.sleep(100e-3)  # 100ms
+        print("\ndone")
+        return
 
 
-if __name__ == "__main__":
-    import signal
-    import sys
+    if __name__ == "__main__":
+        import signal
+        import sys
 
-    async def removetasks(loop):
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        async def removetasks(loop):
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
-        for task in tasks:
-            # skipping over shielded coro still does not help
-            if task._coro.__name__ == "cant_stop_me":
-                continue
-            task.cancel()
+            for task in tasks:
+                # skipping over shielded coro still does not help
+                if task._coro.__name__ == "cant_stop_me":
+                    continue
+                task.cancel()
 
-        print("Cancelling outstanding tasks")
-        await asyncio.gather(*tasks, return_exceptions=True)
-        loop.stop()
+            print("Cancelling outstanding tasks")
+            await asyncio.gather(*tasks, return_exceptions=True)
+            loop.stop()
 
-    async def shutdown_signal(signal, loop):
-        print(f"Received exit signal {signal.name}...")
-        await removetasks(loop)
+        async def shutdown_signal(signal, loop):
+            print(f"Received exit signal {signal.name}...")
+            await removetasks(loop)
 
-    async def main():
-        # if __name__ == "__main__":
-        try:
-            loop = asyncio.get_event_loop()
-        except Exception:
-            loop = asyncio.new_event_loop()
-
-        signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
-        for s in signals:
-            loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown_signal(s, loop)))
-
-        remote_control = None
-        try:
-            # setup()
-            remote_control = Gamepad()
-            if not remote_control:
-                print("Please connect an Xbox controller then restart the program!")
-                sys.exit()
-            print("Connected!")
-
-            # asyncio.run(remote_control.read_gamepad_input())
-            await asyncio.gather(remote_control.read_gamepad_input(), controller_test(remote_control))
-        except Exception as e:
-            print(f"Error occured {e}")
-        finally:
-            if remote_control:
-                remote_control.listening = False
-                remote_control.erase_rumble()
-            print("Closing async loop..")
+        async def main():
+            # if __name__ == "__main__":
             try:
-                pending = asyncio.all_tasks()
-                loop.run_until_complete(asyncio.gather(*pending))
+                loop = asyncio.get_event_loop()
             except Exception:
-                print("No tasks to close")
-            print("Done..")
+                loop = asyncio.new_event_loop()
 
-    asyncio.run(main())
+            signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+            for s in signals:
+                loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown_signal(s, loop)))
+
+            remote_control = None
+            try:
+                # setup()
+                remote_control = Gamepad()
+                if not remote_control:
+                    print("Please connect an Xbox controller then restart the program!")
+                    sys.exit()
+                print("Connected!")
+
+                # asyncio.run(remote_control.read_gamepad_input())
+                await asyncio.gather(remote_control.read_gamepad_input(), controller_test(remote_control))
+            except Exception as e:
+                print(f"Error occured {e}")
+            finally:
+                if remote_control:
+                    remote_control.listening = False
+                    remote_control.erase_rumble()
+                print("Closing async loop..")
+                try:
+                    pending = asyncio.all_tasks()
+                    loop.run_until_complete(asyncio.gather(*pending))
+                except Exception:
+                    print("No tasks to close")
+                print("Done..")
+
+        asyncio.run(main())

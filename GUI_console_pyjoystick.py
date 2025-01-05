@@ -1,24 +1,30 @@
-# from time import perf_counter
-# import time
-
 import contextlib
 import queue
 import traceback
+from time import perf_counter
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtWidgets import QApplication
+from PySide6.QtSerialPort import QSerialPort
 
 import numpy as np
 import pyqtgraph as pg
 from msgpack import Packer, Unpacker
 from pyqtgraph import PlotDataItem, PlotWidget
-from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtWidgets import QApplication
-from PySide6.QtSerialPort import QSerialPort
 
 # import PySide6.QtAsyncio as QtAsyncio     # doesn't support the task used to read the controller yet
 # from qasync import QApplication, QEventLoop
 
+import gamepad
 from gamepad import GamepadState
-from simple_msgpack_console import parse_messages, rxQueue, get_data_packet
-from pico_interface import ControlPacket, MotionVector, calc_steer_center, calc_motion_vec
+from simple_msgpack_console import parse_messages, rxQueue, get_data_packet, WrapMsgPack
+from pico_interface import (
+    ControlPacket,
+    MotionVector,
+    calc_steer_center,
+    calc_motion_vec,
+    PicoSerial,
+)
 from pico_interface import RCONST
 
 from typing import Dict, Tuple
@@ -47,6 +53,9 @@ class ControlWindow(QtWidgets.QWidget):
         self.controller_toggle = QtWidgets.QToolButton()
         self.ctrlpacket = ControlPacket()
         self.running = False
+
+        self.last_packet: ControlPacket = ControlPacket()
+        self.last_packet_time = 0
         #   self.controller = controller
 
         ## data plot
@@ -203,22 +212,15 @@ class ControlWindow(QtWidgets.QWidget):
 
     def update_data(self):
         self.ctrlpacket = ControlPacket(
-            False, False, 0, self.ctrlstate.joystick_left_x, self.ctrlstate.joystick_left_y
+            self.ctrlstate.button_a,
+            self.ctrlstate.button_b,
+            int(self.ctrlstate.trigger_right * RCONST.TRIGGER_MAX),
+            int(self.ctrlstate.joystick_left_x * RCONST.JOY_MAX),
+            int(self.ctrlstate.joystick_left_y * RCONST.JOY_MAX),
         )
-        d, h = calc_steer_center(self.ctrlstate.joystick_left_x, self.ctrlstate.joystick_left_y)
-        # d = self.controller.joystick_left_x/160
-        # h = self.controller.joystick_left_y/160
-        mvec = calc_motion_vec(
-            ControlPacket(
-                self.ctrlstate.button_a,
-                self.ctrlstate.button_b,
-                self.ctrlstate.trigger_right,
-                self.ctrlstate.joystick_left_x,
-                self.ctrlstate.joystick_left_y,
-            ),
-            d,
-            h,
-        )
+        d, h = calc_steer_center(self.ctrlpacket.ljx, self.ctrlpacket.ljy)
+        mvec = calc_motion_vec(self.ctrlpacket, d, h)
+        # print(self.ctrlpacket,d,h,mvec)
         angles = mvec.aFL, mvec.aFR, mvec.aBL, mvec.aBR
         # print(angles, f"({d:.2f} {h:.2f})")   #DEBUG wheel data
         angles = wheel_angles_to_pg(*angles)
@@ -232,7 +234,7 @@ class ControlWindow(QtWidgets.QWidget):
         *data,
     ):
         if len(data) > len(self.data):  # FIXME: handle case where only 1 variable is plotted
-            for new_idx in range(len(data) - len(self.data)):
+            for _ in range(len(data) - len(self.data)):
                 idx = len(self.data)
                 self.data.append(np.zeros(1000))
                 self.data[idx][self.tick] = data[idx]
@@ -261,8 +263,11 @@ class ControlWindow(QtWidgets.QWidget):
         # self.start_t = time.time()  # DEBUG perftimer
 
     def send_ctrlpacket(self):
-        if self.console.serial and self.console.serial.isOpen:
-            self.console.send_raw(self.ctrlpacket)
+        if not self.console.serial.isOpen():
+            return
+        if self.ctrlpacket != self.last_packet or perf_counter() - self.last_packet_time > 5:
+            self.console.send_raw(WrapMsgPack(packer, self.ctrlpacket.to_iter()))
+            self.last_packet_time = perf_counter()
 
 
 class SerialConsoleWidget(QtWidgets.QWidget):
@@ -271,7 +276,9 @@ class SerialConsoleWidget(QtWidgets.QWidget):
         self.message_le = QtWidgets.QLineEdit()
         self.send_btn = QtWidgets.QPushButton(text="Send", clicked=self.send)
         self.output_te = QtWidgets.QTextEdit(readOnly=True)
-        self.button = QtWidgets.QPushButton(text="Connect Serial", checkable=True, toggled=self.on_toggled)
+        self.button = QtWidgets.QPushButton(
+            text="Connect Serial", checkable=True, toggled=self.on_toggled
+        )
         lay = QtWidgets.QVBoxLayout(self)
         hlay = QtWidgets.QHBoxLayout()
         hlay.addWidget(self.message_le)
@@ -281,7 +288,8 @@ class SerialConsoleWidget(QtWidgets.QWidget):
         lay.addWidget(self.button)
 
         self.serial = QSerialPort(
-            "/dev/ttyACM0",
+            # "/dev/ttyACM0",
+            PicoSerial.find_pico(),
             baudRate=115200,
             readyRead=self.receive,
             flowControl=QSerialPort.FlowControl.NoFlowControl,

@@ -1,7 +1,7 @@
 import logging
 from asyncio import Queue
 from dataclasses import dataclass
-from math import atan
+from math import atan, tan
 
 import msgpack
 import numpy as np
@@ -22,11 +22,13 @@ PICO_RX_INDEX = 0x21
 class Rover_Constants:
     SCDX: int = 114
     SCDY: int = 141
-    # JOY_MAX: int = 32767
-    # RT_MAX: int = 1024
+    JOY_MAX: int = 32767
+    TRIGGER_MAX: int = 1023
     STEERCTR_D_MIN: int = 254
-    STEERCTR_SCALING: int = 250
+    STEERCTR_SCALING: int = 25
+    STEERCTR_SCALING2: int = 2
     STEERANG_MAX_RAD: float = np.pi / 4
+    STEERANG_MIN_RAD: float = 2*np.pi/180   # 1 degree min
     STEER_RATIO: int = 2
     RAD2DEG = 180 / np.pi
 
@@ -149,17 +151,28 @@ class PicoSerial:
 
 
 def calc_steer_center(joyx, joyy):
-    # d = np.sign(joyx) * RCONST.STEERCTR_D_MIN + (joyx/10)
-    d = np.sign(joyx) * (
-        abs(RCONST.STEERCTR_D_MIN)
-        + abs(RCONST.STEERCTR_SCALING * np.tan(abs(joyx) * np.pi / 2 - np.pi / 2))
-        # + RCONST.STEERCTR_SCALING * abs(np.tan(joyx * np.pi / (-2 * RCONST.JOY_MAX) + np.pi / 2))
-    )
-    h = -joyy * (abs(d) - RCONST.STEERCTR_D_MIN) * np.tan(RCONST.STEERANG_MAX_RAD)
-    return (d, h)
+        # d = np.sign(joyx) * RCONST.STEERCTR_D_MIN + (joyx/10)
+    # d = np.sign(joyx) * (
+    #     abs(RCONST.STEERCTR_D_MIN)
+    #     + abs(RCONST.STEERCTR_SCALING * np.tan(abs(joyx) * np.pi / 2 - np.pi / 2))
+    #     # + RCONST.STEERCTR_SCALING * abs(np.tan(joyx * np.pi / (-2 * RCONST.JOY_MAX) + np.pi / 2))
+    # )
+    # h = -joyy * (abs(d) - RCONST.STEERCTR_D_MIN) * np.tan(RCONST.STEERANG_MAX_RAD)
+    # return (d, h)
+    jx = joyx/RCONST.JOY_MAX
+    jy = joyy/RCONST.JOY_MAX
+    theta_FR_ideal = jx * RCONST.STEERANG_MAX_RAD
+    if abs(theta_FR_ideal) < RCONST.STEERANG_MIN_RAD:
+        # print(f"{jx:.3}, {jy:.3}, {theta_FR_ideal:.2},{RCONST.STEERANG_MIN_RAD:.1}")
+        return (0,0)
+    sign = 1 if joyx > 0 else -1
+    d = sign * RCONST.SCDX + RCONST.SCDY / tan(jx * RCONST.STEERANG_MAX_RAD)
+    h = -sign * jy * d * tan(RCONST.STEERANG_MAX_RAD)
+    # print(jx, jy, theta_FR_ideal, RCONST.STEERANG_MIN_RAD)
+    return (d,h)
 
 
-def calc_motion_vec(cmd: ControlPacket, d=None, h=None):
+def calc_motion_vec(cmd: ControlPacket, d=None, h=None)->MotionVector:
     if d is None or h is None:
         d, h = calc_steer_center(cmd.ljx, cmd.ljy)
     
